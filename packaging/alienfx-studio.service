@@ -1,0 +1,12 @@
+[Unit]
+Description=Apply the active AlienFX Lighting Studio profile
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=%h/.local/bin/alienfx-studio apply
+
+[Install]
+WantedBy=graphical-session.target
