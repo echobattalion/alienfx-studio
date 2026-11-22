@@ -5,7 +5,7 @@ A native Linux app for editing Alienware laptop lighting per key, saving named p
 - Recolor keys, the power button, touchpad, rear ring, and light bars with live preview
 - Save, rename, and delete profiles
 - Switch profiles from the tray or the command line
-- Restore the active profile at login
+- Choose a default profile that returns at login and after games
 - Never writes to controller flash, so edits cannot wear it out
 
 ## Supported hardware
@@ -63,22 +63,23 @@ Run `./install.sh --help` for options. If the lights do not respond right after 
 
 ```sh
 alienfx-studio                  # open the editor
-alienfx-studio list             # list profiles (* active, > showing temporarily)
-alienfx-studio apply            # apply the active profile
-alienfx-studio apply "Gaming"   # apply a profile and make it active (temporary during a game)
+alienfx-studio list             # list profiles (* default, > showing for now)
+alienfx-studio apply            # apply the default profile
+alienfx-studio apply "Gaming"   # apply a profile for now
+alienfx-studio default "Gaming" # set the default profile
 ```
 
 The app opens on the **Library**, which shows every profile as a card. Click a card to apply that profile. **Edit** or a double-click applies it and opens the Editor. Create a profile with the **New profile** card. Previews never change the lights until you choose one of those actions.
 
 In the Editor, click a key to select it, Ctrl-click to add or remove keys, drag across a group, or use the group chips under the keyboard. Set a color with the hue and saturation sliders, the hex field, or a recent color. Click the large swatch for darker shades. To apply one color to many keys, turn on **Paint mode** with the brush button or `B`, then click or drag across keys. A group chip fills that group, and `Esc` exits. Changes reach the laptop immediately. Press **Save** to keep them. The `⋯` menu holds Save as, Revert, Rename, Delete, and the touchpad gradient. Use the **Library** button to go back. Unsaved edits are kept and marked on the profile's card.
 
-The active profile is the one restored at login. It changes whenever you save or switch profiles.
+Check **Default** on a profile card to make it your default profile. It returns at login and after games, and it is used for games without a profile. Clicking another card changes the lights for now without changing your default.
 
 Profiles are JSON files in `~/.config/alienfx/profiles/`.
 
 ### Game profiles
 
-A background watcher can show a profile while a Steam game runs. The profile applies at launch, stays through alt-tabbing, and returns to your normal profile after the game exits. A game's own link wins, then its game type.
+A background watcher can show a profile while a Steam game runs. The profile applies at launch, stays through alt-tabbing, and returns to your default profile after the game exits. A game's own profile wins, then its game type's profile, then your default profile.
 
 Open **Games** from the Library or tray to assign profiles to game types and individual games, override a detected type, drag types into priority order, or turn automatic switching off. Switching waits while the Editor is open or a profile has unsaved changes. The same controls are available from the command line:
 
@@ -92,7 +93,7 @@ alienfx-studio set-type "Cyberpunk" RPG      # override a game's type (or: auto)
 alienfx-studio type-order RPG Shooter Automation Survival Roguelike Adventure
 ```
 
-Types come from each game's Steam store tags. When a game fits several, the first type in the list wins. Rules are stored in `~/.config/alienfx/rules.json`. A profile you choose during a game lasts until that game exits, then your normal profile returns.
+Types come from each game's Steam store tags. When a game fits several, the first type in the list wins. Rules are stored in `~/.config/alienfx/rules.json`. A profile you choose during a game lasts until that game exits, then your default profile returns.
 
 ### Update speed
 

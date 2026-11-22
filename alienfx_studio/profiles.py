@@ -12,6 +12,7 @@ from . import device, kbmap
 from .layout import ELC_ZONES, TOUCHPAD_ZONES
 
 VERSION = 1
+PICKED = "picked"      # a profile applied by hand, outside any game
 _HEX = re.compile(r"^#[0-9a-fA-F]{6}$")
 
 
@@ -124,6 +125,7 @@ class Store:
         self.state = self.root / "state.json"
         runtime = self.root if root else Path(device.runtime_dir())
         self.showing_path = runtime / "alienfx-showing.json"
+        self.running_path = runtime / "alienfx-running.json"
         self.dir.mkdir(parents=True, exist_ok=True)
         if not any(self.dir.glob("*.json")):
             first = default_profile()
@@ -211,9 +213,17 @@ class Store:
             return profiles[0][1]
 
     def set_active(self, name):
-        """Choose the normal profile. A deliberate choice ends any temporary one."""
+        """Make a profile the default and the one showing, ending any temporary one."""
         self._write(self.state, {"active": name})
         self.clear_showing()
+
+    def set_default(self, name):
+        """Change the default profile without changing what is on the lights."""
+        name = self.load(name).name
+        self._write(self.state, {"active": name})
+        showing = self.showing()
+        if showing == (name, PICKED):
+            self.clear_showing()
 
     def showing(self):
         """The temporary profile as (name, source), or None if there is no valid one."""
@@ -239,20 +249,39 @@ class Store:
                     {"profile": self.load(name).name, "source": source, "game": game})
 
     def choose(self, name):
-        """A deliberate pick: temporary during a game session, otherwise the normal profile."""
+        """Apply a profile by hand. It never changes the default profile."""
         showing = self.showing()
-        if showing is None or not device.lock_held(device.WATCH_LOCK):
-            self.set_active(name)
-        elif showing[0] != name:
-            source = showing[1] if showing[1].startswith("manual:") else f"manual:{showing[1]}"
-            self.set_showing(name, source, self.showing_game())
+        if showing and showing[1] != PICKED and device.lock_held(device.WATCH_LOCK):
+            if showing[0] != name:      # during a game: lasts until that game exits
+                source = showing[1] if showing[1].startswith("manual:") else f"manual:{showing[1]}"
+                self.set_showing(name, source, self.showing_game())
+        elif name == self.active_name():
+            self.clear_showing()
+        else:
+            self.set_showing(name, PICKED)
 
     def drop_stale_showing(self):
         """Forget a temporary profile left by a watcher that no longer runs."""
+        showing = self.showing()
+        if showing and showing[1] == PICKED:
+            return False
         if self.showing_path.exists() and not device.lock_held(device.WATCH_LOCK):
             self.clear_showing()
             return True
         return False
+
+    def set_running(self, app_ids):
+        """Published by the watcher, so the GUI can show running games without scanning."""
+        self._write(self.running_path, {"apps": sorted(app_ids)})
+
+    def clear_running(self):
+        self.running_path.unlink(missing_ok=True)
+
+    def running_games(self):
+        try:
+            return {int(a) for a in json.loads(self.running_path.read_text())["apps"]}
+        except (OSError, ValueError, KeyError, TypeError):
+            return set()
 
     def state_stamp(self):
         """Changes whenever the normal or temporary profile may have changed."""

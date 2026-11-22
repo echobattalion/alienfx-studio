@@ -85,9 +85,11 @@ def main():
     sub = parser.add_subparsers(dest="cmd")
     gui = sub.add_parser("gui", help="open the editor (default)")
     gui.add_argument("--tray", action="store_true", help="start hidden in the tray")
-    apply_cmd = sub.add_parser("apply", help="apply a profile (default: the active one)")
+    apply_cmd = sub.add_parser("apply", help="apply a profile (default: the default profile)")
     apply_cmd.add_argument("name", nargs="?")
     sub.add_parser("list", help="list profiles")
+    default_cmd = sub.add_parser("default", help="set the default profile")
+    default_cmd.add_argument("name")
     sub.add_parser("watch", help="switch profiles while linked games run")
     sub.add_parser("games", help="list installed Steam games, types, and profiles")
     sub.add_parser("types", help="list game types in match order")
@@ -121,14 +123,18 @@ def main():
                 mark = "*" if name == active else ">" if name == current else " "
                 print(f"{mark} {name}")
             return 0
+        if args.cmd == "default":
+            store.set_default(args.name)
+            print(f"Default profile: {store.active_name()}")
+            return 0
         if args.cmd != "apply":
             return _rules_command(args, store)
         profile = store.load(args.name or store.active_name())
         device.send(device.build_frame(profile))
         if args.name:
-            store.choose(profile.name)      # during a game, lasts until the game exits
+            store.choose(profile.name)      # never changes the default profile
         else:
-            store.set_active(profile.name)  # the login restore always ends a temporary profile
+            store.set_active(profile.name)  # the login restore ends any temporary profile
         print(f"Applied {profile.name}")
         return 0
     except (ProfileError, device.DeviceError, OSError) as e:

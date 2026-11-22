@@ -1,5 +1,6 @@
 """Main window: the Obsidian editor shell and Library navigation."""
 import colorsys
+import os
 import sys
 
 from PyQt6.QtCore import QEvent, QPointF, Qt, QTimer, pyqtSignal
@@ -11,16 +12,19 @@ from PyQt6.QtWidgets import (QApplication, QColorDialog, QHBoxLayout, QInputDial
 
 from . import device, layout, rules, theme
 from .color_dock import ColorDock
+from .file_events import FileEvents
 from .games import GamesPage
+from .inotify import OVERFLOW
 from .keyboard_view import KeyboardView
 from .library import LibraryPage
-from .profiles import Profile, ProfileError, Store, to_hex
+from .profiles import PICKED, Profile, ProfileError, Store, to_hex
 from .tray import Tray, app_icon
 
 SERVER_NAME = "alienfx-studio"
 MAX_UNDO = 100
 MAX_RECENT = 10
 _STATUS_WIDTH = 340
+_STATE_FILES = {"state.json", "alienfx-showing.json", "alienfx-running.json", device.WATCH_LOCK}
 
 
 class Backdrop(QWidget):
@@ -69,9 +73,9 @@ class MainWindow(QMainWindow):
         self._refresh_profiles()
         self._sync_controls()
         self._update_selection_ui()
-        self._game_timer = QTimer(self, interval=1000)
-        self._game_timer.timeout.connect(self._poll_game_state)
-        self._game_timer.start()
+        self.file_events = FileEvents(self)
+        self.file_events.changed.connect(self._files_changed)
+        self.file_events.watch([self.store.root, device.runtime_dir()])
 
     # ---- UI construction ----
     def _build_ui(self):
@@ -221,7 +225,8 @@ class MainWindow(QMainWindow):
 
     def _read_game_session(self):
         showing = self.store.showing()
-        self.game_session = (showing[0], self.store.showing_game()) if showing else None
+        in_game = showing is not None and showing[1] != PICKED
+        self.game_session = (showing[0], self.store.showing_game()) if in_game else None
 
     def _refresh_profiles(self):
         self._read_game_session()
@@ -586,6 +591,17 @@ class MainWindow(QMainWindow):
         elif not paused and self._pause_lock is not None:
             self._pause_lock.close()
             self._pause_lock = None
+            QTimer.singleShot(0, self._poll_game_state)     # catch up on what editing held back
+
+    def _files_changed(self, paths):
+        """React to the watcher, the command line, or a crash. None means anything changed."""
+        names = None if paths is None or OVERFLOW in paths \
+            else {os.path.basename(path) for path in paths}
+        if names is None or names & _STATE_FILES:
+            self._poll_game_state()
+            self.games.update_status()
+        if names is None or "rules.json" in names:
+            self.games.rules_changed()
 
     def _poll_game_state(self):
         self._update_pause()
@@ -610,6 +626,11 @@ class MainWindow(QMainWindow):
         if self._restore_pending:
             self._restore_pending = False
             self._push_live()
+
+    def set_default_profile(self, name):
+        """Change the default profile. The lights stay as they are."""
+        self._guard(self.store.set_default, name)
+        self._refresh_profiles()
 
     def auto_switch(self):
         try:

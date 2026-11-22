@@ -1,14 +1,17 @@
 """Background watcher: show a game's profile from launch until it exits."""
 import os
+import select
 import signal
 import threading
 import time
 
-from . import device, rules
-from .profiles import ProfileError, Store
+from . import device, inotify, rules, steam
+from .profiles import PICKED, ProfileError, Store
 from .steam import Library
 
-POLL_SECONDS = 2.5
+GAME_SECONDS = 2.5      # a game is running: notice its exit promptly
+IDLE_SECONDS = 5.0      # Steam is open: a launch is hidden by the game's loading time
+FALLBACK_SECONDS = 10.0  # Steam's state cannot be watched
 EXIT_GRACE = 5.0     # a game that restarts itself should not flash the lights
 
 
@@ -56,6 +59,7 @@ class Watcher:
         self.held = None         # (source, profile) currently shown for a game
         self.user_choice = None  # app_id whose session the user took over
         self.frame = None
+        self.reported = None     # the running set last published to the GUI
         self.rules = rules.Rules()
         self._rules_stamp = None
         self._reload_rules()
@@ -73,7 +77,19 @@ class Watcher:
         except (rules.RulesError, OSError) as e:
             log(f"keeping previous rules: {e}")
 
+    def delay(self):
+        """Seconds until the next scan, or None to sleep until something changes."""
+        if self.games:
+            return GAME_SECONDS
+        state = steam.steam_state()
+        if state == steam.STEAM_RUNNING:
+            return IDLE_SECONDS
+        return None if state == steam.STEAM_STOPPED else FALLBACK_SECONDS
+
     def _track(self, running, now):
+        if running != self.reported:
+            self.store.set_running(running)
+            self.reported = set(running)
         for app_id in sorted(running - set(self.games)):
             self.games[app_id] = self.library.game(app_id)
             log(f"started: {self.games[app_id].name} ({app_id})")
@@ -93,6 +109,8 @@ class Watcher:
             found = self.rules.profile_for(game.key, game.tags, self.store.exists)
             if found:
                 return game, *found
+        if self.games and self.rules.enabled:
+            return next(iter(self.games.values())), self.store.active_name(), "default profile"
         return None
 
     def _send(self, name):
@@ -104,14 +122,16 @@ class Watcher:
             self.submit(self.frame)
 
     def release(self):
-        """Return to the normal profile."""
-        had_temporary = self.store.showing() is not None
+        """End a game's lighting and return to the default profile."""
+        showing = self.store.showing()
+        self.held = None
+        if showing is None or showing[1] == PICKED:     # nothing of ours is on the lights
+            return
         self.store.clear_showing()
-        if (self.held or had_temporary) and not self.paused():   # never overwrite the editor
-            name = self.store.active_name()
+        name = self.store.active_name()
+        if showing[0] != name and not self.paused():    # never overwrite the editor
             self._send(name)
             log(f"restored: {name}")
-        self.held = None
 
     def tick(self, now):
         self._reload_rules()
@@ -136,10 +156,45 @@ class Watcher:
             return
         game, profile, reason = target
         if self.held != (game.key, profile):
+            before = self.store.current_name()
             self.store.set_showing(profile, game.key, game.name)
-            self._send(profile)
+            if before != profile:
+                self._send(profile)
+            else:
+                self.frame = None               # already on the lights
             self.held = (game.key, profile)
             log(f"showing: {profile} for {game.name} ({reason})")
+
+
+def _sleep(notifier, wake_fd, delay, wake_paths):
+    """Wait for the delay, a relevant file change, or a wake-up. None waits indefinitely."""
+    deadline = None if delay is None else time.monotonic() + delay
+    sources = [wake_fd] + ([notifier] if notifier else [])
+    while True:
+        left = None if deadline is None else deadline - time.monotonic()
+        if left is not None and left <= 0:
+            return
+        ready = select.select(sources, [], [], left)[0]
+        if wake_fd in ready:
+            os.read(wake_fd, 4096)
+            return
+        if notifier in ready:
+            changed = notifier.read()
+            if inotify.OVERFLOW in changed or changed & wake_paths:
+                return
+
+
+def _open_notifier(store):
+    """Watch for Steam starting and for the editor finishing."""
+    pid_path = steam.pid_file()
+    try:
+        notifier = inotify.Notifier()
+        notifier.add(device.runtime_dir())
+        notifier.add(pid_path.parent)
+    except OSError as e:
+        log(f"file notifications unavailable, checking every {FALLBACK_SECONDS:.0f}s: {e}")
+        return None, set()
+    return notifier, {str(pid_path), os.path.join(device.runtime_dir(), device.EDITOR_LOCK)}
 
 
 def run():
@@ -151,6 +206,13 @@ def run():
     stop = threading.Event()
     failed = threading.Event()
     failing = [False]
+    wake_read, wake_write = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+
+    def wake():
+        try:
+            os.write(wake_write, b"x")
+        except BlockingIOError:      # a wake-up is already queued
+            pass
 
     def on_result(ok, message):
         if ok:
@@ -160,27 +222,46 @@ def run():
             log(f"lighting write failed: {message}")
         failing[0] = True
         failed.set()
+        wake()
+
+    def on_signal(*_):
+        stop.set()
+        wake()
 
     for sig in (signal.SIGTERM, signal.SIGINT):
-        signal.signal(sig, lambda *_: stop.set())
+        signal.signal(sig, on_signal)
 
+    store = Store()
+    notifier, wake_paths = _open_notifier(store)   # before the first scan, so no start is missed
     writer = device.LiveWriter(on_result)
-    watcher = Watcher(Store(), Library(), writer.submit)
+    watcher = Watcher(store, Library(), writer.submit)
     log("watching for Steam games")
     try:
         while not stop.is_set():
+            retry = False
             try:
                 watcher.tick(time.monotonic())
                 if failed.is_set():
                     failed.clear()
                     watcher.resend()
+                    retry = True
+                delay = watcher.delay()
             except (ProfileError, device.DeviceError, OSError) as e:
                 log(f"error: {e}")
-            stop.wait(POLL_SECONDS)
+                retry = True
+                delay = GAME_SECONDS
+            if retry:
+                delay = min(delay or GAME_SECONDS, GAME_SECONDS)
+            elif delay is None and notifier is None:
+                delay = FALLBACK_SECONDS
+            _sleep(notifier, wake_read, delay, wake_paths)
     finally:
         try:
             watcher.release()
+            store.clear_running()
         except (ProfileError, device.DeviceError, OSError) as e:
-            log(f"could not restore the normal profile: {e}")
+            log(f"could not restore the default profile: {e}")
         writer.close()
+        if notifier:
+            notifier.close()
     return 0

@@ -73,7 +73,11 @@ def try_lock(name, retries=0):
 
 def lock_held(name):
     """Whether any open file holds the lock. A shared probe cannot block a real holder."""
-    with open(os.path.join(runtime_dir(), name), "a") as lock:
+    try:
+        lock = open(os.path.join(runtime_dir(), name))   # read-only: raises no change event
+    except FileNotFoundError:
+        return False
+    with lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
             return False

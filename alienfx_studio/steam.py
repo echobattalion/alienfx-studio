@@ -17,6 +17,9 @@ _APPID = re.compile(r'"appid"\s+"(\d+)"')
 _NAME = re.compile(r'"name"\s+"((?:[^"\\]|\\.)*)"')
 
 
+STEAM_RUNNING, STEAM_STOPPED, STEAM_UNKNOWN = "running", "stopped", "unknown"
+
+
 class SteamError(Exception):
     pass
 
@@ -39,6 +42,24 @@ def find_root():
         if (Path(candidate) / "steamapps").is_dir():
             return Path(candidate).resolve()
     return None
+
+
+def pid_file():
+    """Steam writes its process ID here each time it starts."""
+    return Path(os.environ.get("ALIENFX_STEAM_PID") or "~/.steam/steam.pid").expanduser()
+
+
+def steam_state(path=None, proc="/proc"):
+    """Whether Steam runs. Unknown means its PID file cannot be used as a signal."""
+    try:
+        pid = int(Path(path or pid_file()).read_text().strip())
+    except (OSError, ValueError):
+        return STEAM_UNKNOWN
+    try:
+        with open(f"{proc}/{pid}/comm") as f:
+            return STEAM_RUNNING if f.read().strip() == "steam" else STEAM_STOPPED
+    except OSError:
+        return STEAM_STOPPED
 
 
 def _unescape(text):
@@ -149,6 +170,31 @@ def tag_names():
 class Library:
     def __init__(self, root=None):
         self.root = Path(root) if root else find_root()
+
+    def watch_dirs(self):
+        """Directories whose changes can alter the game list."""
+        if self.root is None:
+            return []
+        dirs = [*_library_dirs(self.root), self.root / "appcache"]
+        return [d for d in dirs if d.is_dir()]
+
+    def stamp(self):
+        """Changes when games are added or removed, or Steam updates its metadata.
+
+        Manifest times are left out because they change constantly during a download.
+        """
+        if self.root is None:
+            return None
+        times = []
+        for path in (self.root / "appcache" / "appinfo.vdf",
+                     self.root / "steamapps" / "libraryfolders.vdf"):
+            try:
+                times.append(path.stat().st_mtime_ns)
+            except OSError:
+                times.append(None)
+        manifests = frozenset(str(path) for directory in _library_dirs(self.root)
+                              for path in directory.glob("appmanifest_*.acf"))
+        return manifests, tuple(times)
 
     def games(self):
         """Installed games by name. Tools like Proton are left out when metadata exists."""
