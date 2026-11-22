@@ -138,6 +138,7 @@ if ((SERVICES)); then
     say "Enabling login service and tray"
     mkdir -p "$CONFIG/systemd/user" "$CONFIG/autostart"
     install -m 644 "$REPO/packaging/alienfx-studio.service" "$CONFIG/systemd/user/alienfx-studio.service"
+    install -m 644 "$REPO/packaging/alienfx-studio-watch.service" "$CONFIG/systemd/user/alienfx-studio-watch.service"
     cat > "$CONFIG/autostart/alienfx-studio-tray.desktop" <<EOF
 [Desktop Entry]
 Type=Application
@@ -147,13 +148,15 @@ Icon=input-keyboard
 X-KDE-autostart-after=panel
 EOF
     systemctl --user daemon-reload
-    systemctl --user enable alienfx-studio.service
+    systemctl --user enable alienfx-studio.service alienfx-studio-watch.service
     if [[ -e $CONFIG/systemd/user/alienfx-scheme.service ]]; then
         echo "Note: an older alienfx-scheme.service exists. Disable it to avoid two login writers:"
         echo "  systemctl --user disable alienfx-scheme.service"
     fi
     systemctl --user restart alienfx-studio.service || \
         echo "Could not apply lighting yet. Log out and back in, then run: alienfx-studio apply"
+    systemctl --user restart alienfx-studio-watch.service || \
+        echo "Could not start the game watcher yet. It will start at next login."
 fi
 
 say "Done"

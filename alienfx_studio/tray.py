@@ -32,6 +32,11 @@ class Tray(QSystemTrayIcon):
 
     def rebuild(self):
         self.menu.clear()
+        session = self.window.game_session
+        if session:
+            status = self.menu.addAction(f"{session[1] or 'Game'}: {session[0]}")
+            status.setEnabled(False)
+            self.menu.addSeparator()
         group = QActionGroup(self.menu)
         current = self.window.profile.name
         for _, name in self.window.store.list():
@@ -39,6 +44,12 @@ class Tray(QSystemTrayIcon):
             action.triggered.connect(lambda _=False, n=name: self.window.switch_profile(n))
             group.addAction(action)
             self.menu.addAction(action)
+        self.menu.addSeparator()
+        auto = QAction("Automatic game switching", self.menu, checkable=True,
+                       checked=self.window.auto_switch())
+        auto.triggered.connect(self.window.set_auto_switch)
+        self.menu.addAction(auto)
+        self.menu.addAction("Games", self.window.open_games)
         self.menu.addSeparator()
         self.menu.addAction("Open Editor", self.window.open_editor)
         self.menu.addAction("Quit", self.quit_fn)

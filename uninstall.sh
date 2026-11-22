@@ -12,16 +12,17 @@ for arg in "$@"; do
         --remove-udev) UDEV=1 ;;
         -h|--help)
             echo "Usage: ./uninstall.sh [--purge] [--remove-udev]"
-            echo "  --purge        Also delete saved profiles"
+            echo "  --purge        Also delete saved profiles and game rules"
             echo "  --remove-udev  Also remove the udev rule (uses sudo)"
             exit 0 ;;
         *) echo "Unknown option: $arg" >&2; exit 2 ;;
     esac
 done
 
-systemctl --user disable --now alienfx-studio.service 2>/dev/null || true
+systemctl --user disable --now alienfx-studio-watch.service alienfx-studio.service 2>/dev/null || true
 pkill -f 'python3 -m alienfx_studio' 2>/dev/null || true
 rm -f "$CONFIG/systemd/user/alienfx-studio.service" \
+      "$CONFIG/systemd/user/alienfx-studio-watch.service" \
       "$CONFIG/autostart/alienfx-studio-tray.desktop" \
       "$DATA/applications/alienfx-studio.desktop" \
       "$HOME/.local/bin/alienfx-studio"
@@ -29,7 +30,7 @@ rm -rf "$DATA/alienfx-studio"
 systemctl --user daemon-reload 2>/dev/null || true
 
 if ((PURGE)); then
-    rm -rf "$CONFIG/alienfx/profiles" "$CONFIG/alienfx/state.json"
+    rm -rf "$CONFIG/alienfx/profiles" "$CONFIG/alienfx/state.json" "$CONFIG/alienfx/rules.json"
 fi
 if ((UDEV)); then
     sudo rm -f /etc/udev/rules.d/61-alienfx.rules

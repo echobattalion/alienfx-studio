@@ -8,10 +8,11 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import kbmap
+from . import device, kbmap
 from .layout import ELC_ZONES, TOUCHPAD_ZONES
 
 VERSION = 1
+PICKED = "picked"      # a profile applied by hand, outside any game
 _HEX = re.compile(r"^#[0-9a-fA-F]{6}$")
 
 
@@ -122,6 +123,9 @@ class Store:
         self.root = Path(root) if root else Path(base) / "alienfx"
         self.dir = self.root / "profiles"
         self.state = self.root / "state.json"
+        runtime = self.root if root else Path(device.runtime_dir())
+        self.showing_path = runtime / "alienfx-showing.json"
+        self.running_path = runtime / "alienfx-running.json"
         self.dir.mkdir(parents=True, exist_ok=True)
         if not any(self.dir.glob("*.json")):
             first = default_profile()
@@ -183,12 +187,19 @@ class Store:
             raise ProfileError(f"a profile named {new!r} already exists")
         profile = self.load(old)
         was_active = self.active_name() == profile.name
+        showing, game = self.showing(), self.showing_game()
+        was_showing = showing is not None and showing[0] == profile.name
+        old_name = profile.name
         profile.name = new.strip()
         self.save(profile)
         if new_slug != slug:
             (self.dir / f"{slug}.json").unlink()
+        from . import rules          # rules builds on this module
+        rules.rename_profile(self.root, old_name, profile.name)
         if was_active:
-            self.set_active(profile.name)
+            self._write(self.state, {"active": profile.name})   # keeps any temporary profile
+        if was_showing:
+            self.set_showing(profile.name, showing[1], game)
         return profile
 
     def active_name(self):
@@ -202,4 +213,90 @@ class Store:
             return profiles[0][1]
 
     def set_active(self, name):
+        """Make a profile the default and the one showing, ending any temporary one."""
         self._write(self.state, {"active": name})
+        self.clear_showing()
+
+    def set_default(self, name):
+        """Change the default profile without changing what is on the lights."""
+        name = self.load(name).name
+        self._write(self.state, {"active": name})
+        showing = self.showing()
+        if showing == (name, PICKED):
+            self.clear_showing()
+
+    def showing(self):
+        """The temporary profile as (name, source), or None if there is no valid one."""
+        try:
+            data = json.loads(self.showing_path.read_text())
+            return self.load(data["profile"]).name, str(data["source"])
+        except (OSError, ValueError, KeyError, TypeError, AttributeError, ProfileError):
+            return None
+
+    def showing_game(self):
+        """The display name of the game behind the temporary profile, if any."""
+        if self.showing() is None:
+            return ""
+        try:
+            game = json.loads(self.showing_path.read_text()).get("game", "")
+            return game if isinstance(game, str) else ""
+        except (OSError, ValueError, AttributeError):
+            return ""
+
+    def set_showing(self, name, source, game=""):
+        """Show a profile temporarily without changing the one restored at login."""
+        self._write(self.showing_path,
+                    {"profile": self.load(name).name, "source": source, "game": game})
+
+    def choose(self, name):
+        """Apply a profile by hand. It never changes the default profile."""
+        showing = self.showing()
+        if showing and showing[1] != PICKED and device.lock_held(device.WATCH_LOCK):
+            if showing[0] != name:      # during a game: lasts until that game exits
+                source = showing[1] if showing[1].startswith("manual:") else f"manual:{showing[1]}"
+                self.set_showing(name, source, self.showing_game())
+        elif name == self.active_name():
+            self.clear_showing()
+        else:
+            self.set_showing(name, PICKED)
+
+    def drop_stale_showing(self):
+        """Forget a temporary profile left by a watcher that no longer runs."""
+        showing = self.showing()
+        if showing and showing[1] == PICKED:
+            return False
+        if self.showing_path.exists() and not device.lock_held(device.WATCH_LOCK):
+            self.clear_showing()
+            return True
+        return False
+
+    def set_running(self, app_ids):
+        """Published by the watcher, so the GUI can show running games without scanning."""
+        self._write(self.running_path, {"apps": sorted(app_ids)})
+
+    def clear_running(self):
+        self.running_path.unlink(missing_ok=True)
+
+    def running_games(self):
+        try:
+            return {int(a) for a in json.loads(self.running_path.read_text())["apps"]}
+        except (OSError, ValueError, KeyError, TypeError):
+            return set()
+
+    def state_stamp(self):
+        """Changes whenever the normal or temporary profile may have changed."""
+        stamps = []
+        for path in (self.state, self.showing_path):
+            try:
+                stamps.append(path.stat().st_mtime_ns)
+            except OSError:
+                stamps.append(None)
+        return tuple(stamps)
+
+    def clear_showing(self):
+        self.showing_path.unlink(missing_ok=True)
+
+    def current_name(self):
+        """The profile that should be on the lights right now."""
+        showing = self.showing()
+        return showing[0] if showing else self.active_name()

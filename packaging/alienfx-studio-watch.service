@@ -1,0 +1,12 @@
+[Unit]
+Description=Switch AlienFX Lighting Studio profiles while games run
+After=graphical-session.target alienfx-studio.service
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/alienfx-studio watch
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

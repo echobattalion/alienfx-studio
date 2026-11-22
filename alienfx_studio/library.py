@@ -2,9 +2,9 @@
 import sys
 from collections import Counter
 
-from PyQt6.QtCore import QPointF, QSize, Qt
-from PyQt6.QtGui import QColor, QPainter, QRadialGradient
-from PyQt6.QtWidgets import (QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMenu,
+from PyQt6.QtCore import QPointF, QRectF, QSize, Qt
+from PyQt6.QtGui import QColor, QPainter, QPen, QRadialGradient
+from PyQt6.QtWidgets import (QCheckBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMenu,
                              QPushButton, QScrollArea, QSizePolicy, QToolButton, QVBoxLayout,
                              QWidget)
 
@@ -64,13 +64,45 @@ class PreviewPane(QWidget):
         p.fillRect(self.rect().adjusted(2, 2, -2, 0), gradient)
 
 
+class DefaultCheck(QCheckBox):
+    """A checkbox whose box stays visible on the dark card."""
+    BOX = 16
+
+    def sizeHint(self):
+        return QSize(self.BOX + 7 + self.fontMetrics().horizontalAdvance(self.text()) + 4,
+                     max(self.BOX + 4, self.fontMetrics().height()))
+
+    def hitButton(self, pos):
+        return self.rect().contains(pos)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        box = QRectF(1, (self.height() - self.BOX) / 2, self.BOX, self.BOX)
+        on = self.isChecked()
+        edge = "#FFFFFF" if self.hasFocus() else theme.ACCENT if on else "#77717F"
+        p.setPen(QPen(QColor(edge), 1.4))
+        p.setBrush(QColor(theme.ACCENT) if on else Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(box, 4, 4)
+        if on:
+            p.save()
+            p.translate(box.left() + 2, box.top() + 2)
+            p.scale((self.BOX - 4) / 24, (self.BOX - 4) / 24)
+            p.fillPath(theme.icon_path("check"), QColor("#16061A"))
+            p.restore()
+        p.setPen(QColor(theme.TEXT))
+        area = self.rect().adjusted(self.BOX + 7, 0, 0, 0)
+        p.drawText(area, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self.text())
+
+
 class ProfileCard(QFrame):
-    def __init__(self, window, profile, active):
+    def __init__(self, window, profile, active, is_default=False):
         super().__init__()
         self.window_ = window
         self.profile = profile
         self.name = profile.name
         self.active = active
+        self.is_default = is_default
         self._pressed = False
         self.setObjectName("card")
         self.setAttribute(Qt.WidgetAttribute.WA_Hover)
@@ -109,10 +141,18 @@ class ProfileCard(QFrame):
         self.name_label.setToolTip(self.name)
         self.name_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.status = QLabel(objectName="muted")
+        self.status.setTextFormat(Qt.TextFormat.PlainText)
+        self.status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         text.addWidget(self.name_label)
         text.addWidget(self.status)
         footer.addLayout(text, 1)
 
+        self.default_box = DefaultCheck("Default", checked=is_default)
+        self.default_box.setAccessibleName(f"Use {self.name} as the default profile")
+        self.default_box.setToolTip("The default profile returns at login and after games,\n"
+                                    "and is used for games without a profile.")
+        self.default_box.clicked.connect(self._make_default)
+        footer.addWidget(self.default_box)
         self.edit_btn = QPushButton("Edit")
         self.edit_btn.setToolTip(f"Apply and edit {self.name}" if not active
                                  else f"Edit {self.name}")
@@ -135,13 +175,28 @@ class ProfileCard(QFrame):
         self.profile = profile
         self.preview.set_profile(profile)
         if self.active:
-            self.status.setText("Unsaved changes" if dirty else "Restored at login")
+            session = self.window_.game_session
+            if dirty:
+                text = "Unsaved changes"
+            elif session and session[0] == self.name:
+                text = f"Until {session[1] or 'the game'} exits"
+            elif self.is_default:
+                text = "Restored at login"
+            else:
+                text = "Applied for now"
+            self.status.setText(text)
+            self.status.setToolTip(text)
             self.status.setObjectName("unsaved" if dirty else "muted")
             self.status.style().unpolish(self.status)
             self.status.style().polish(self.status)
         else:
             lights = sum(1 for i in layout.build_items() if i.enabled)
             self.status.setText(f"{lights} lights · {profile.brightness}% brightness")
+
+    def _make_default(self):
+        self.default_box.setChecked(True)       # one profile is always the default
+        if not self.is_default:
+            self.window_.set_default_profile(self.name)
 
     def apply(self):
         if not self.active:
@@ -220,10 +275,15 @@ class LibraryPage(QWidget):
         brand.addStretch()
         titles.addLayout(brand)
         titles.addWidget(QLabel("Your profiles", objectName="pageTitle"))
-        subtitle = QLabel("Click a profile to apply it. It returns at login.", objectName="muted")
+        subtitle = QLabel("Click a profile to apply it. Your default returns at login and after games.", objectName="muted")
         titles.addWidget(subtitle)
         head.addLayout(titles)
         head.addStretch()
+        self.games_btn = QPushButton(theme.icon("game", theme.TEXT, 18), "Games")
+        self.games_btn.setToolTip("Choose profiles for games and game types")
+        self.games_btn.clicked.connect(lambda: self.window_.show_games())
+        head.addWidget(self.games_btn)
+        head.addSpacing(10)
         self.search = QLineEdit(objectName="search", placeholderText="Search profiles")
         self.search.setClearButtonEnabled(True)
         self.search.setFocusPolicy(Qt.FocusPolicy.ClickFocus)   # no caret on opening
@@ -264,6 +324,7 @@ class LibraryPage(QWidget):
             card.deleteLater()
         self.cards = {}
         current = self.window_.profile
+        default = self.window_.store.active_name()
         for _, name in self.window_.store.list():
             active = name == current.name
             try:
@@ -271,7 +332,7 @@ class LibraryPage(QWidget):
             except (OSError, ValueError, ProfileError) as e:   # a file can vanish between calls
                 print(f"alienfx-studio: skipping {name}: {e}", file=sys.stderr)
                 continue
-            card = ProfileCard(self.window_, profile, active)
+            card = ProfileCard(self.window_, profile, active, name == default)
             card.setParent(self.body)
             self.cards[name] = card
         if current.name in self.cards:

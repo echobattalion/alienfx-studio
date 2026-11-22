@@ -142,6 +142,16 @@ def _build_icon(name):
     elif name == "more":
         for x in (5, 12, 19):
             p.addEllipse(QPointF(x, 12), .4, .4)
+    elif name == "game":
+        p.addRoundedRect(QRectF(2.5, 6.5, 19, 12), 5.5, 5.5)
+        _poly(p, (8, 10), (8, 15), close=False)
+        _poly(p, (5.5, 12.5), (10.5, 12.5), close=False)
+        p.addEllipse(QPointF(15.5, 14), .35, .35)
+        p.addEllipse(QPointF(18, 11), .35, .35)
+    elif name == "drag":
+        for x in (9, 15):
+            for y in (6, 12, 18):
+                p.addEllipse(QPointF(x, y), .35, .35)
     elif name == "undo":
         _poly(p, (9, 14), (4, 9), (9, 4), close=False)
         p.moveTo(4, 9)
@@ -299,6 +309,26 @@ def stylesheet():
     QFrame#newCard {{ background: transparent; border: 1px dashed rgba(255, 255, 255, 45);
                       border-radius: 18px; }}
     QFrame#newCard:hover {{ background: rgba(255, 255, 255, 8); }}
+
+    QFrame#panel {{ background: #131118; border: 1px solid {BORDER}; border-radius: 18px; }}
+    QFrame#gameRow, QFrame#typeRow {{ background: rgba(255, 255, 255, 7); border-radius: 11px; }}
+    QFrame#gameRow:hover, QFrame#typeRow:hover {{ background: rgba(255, 255, 255, 13); }}
+    QLabel#sectionTitle {{ font-size: 18px; font-weight: 600; }}
+    QLabel#rowName {{ font-size: 14px; font-weight: 500; }}
+    QLabel#notice {{ background: rgba(255, 77, 255, 22); color: {TEXT}; border-radius: 10px;
+                     padding: 9px 13px; font-size: 13px; }}
+    QLabel#running {{ background: {OK}; color: #06140C; border-radius: 5px; padding: 2px 7px;
+                      font-size: 11px; font-weight: 700; }}
+    QLabel#dragHandle:focus {{ background: rgba(255, 255, 255, 34); border-radius: 6px; }}
+    QComboBox {{ background: rgba(255, 255, 255, 18); color: {TEXT}; border: none;
+                 border-radius: 8px; padding: 6px 24px 6px 10px; font-size: 13px; }}
+    QComboBox:hover {{ background: rgba(255, 255, 255, 34); }}
+    QComboBox:focus {{ background: rgba(255, 255, 255, 34); }}
+    QComboBox::drop-down {{ border: none; width: 18px; }}
+    QComboBox QAbstractItemView {{ background: {SURFACE}; color: {TEXT};
+        border: 1px solid {BORDER}; selection-background-color: rgba(255, 255, 255, 40);
+        selection-color: {TEXT}; outline: none; }}
+    QCheckBox {{ color: {TEXT}; font-size: 13px; font-weight: 600; }}
     """
 
 

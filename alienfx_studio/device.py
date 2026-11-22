@@ -13,6 +13,8 @@ KEYBOARD_DEV = int(os.environ.get("ALIENFX_KEYBOARD_DEV", 0))
 ELC_DEV = int(os.environ.get("ALIENFX_ELC_DEV", 1))
 SETPOWER_ONLY = {19}       # firmware ignores normal writes to this ELC zone
 TIMEOUT = 10
+WATCH_LOCK = "alienfx-watch.lock"     # held while the game watcher runs
+EDITOR_LOCK = "alienfx-editor.lock"   # held while the GUI needs the lights to itself
 
 
 class DeviceError(Exception):
@@ -44,10 +46,43 @@ def build_frame(profile):
     return Frame("".join(lines), tuple(power))
 
 
-def _lock_path():
+def runtime_dir():
+    """Per-user directory whose contents do not survive a reboot."""
     runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/alienfx-{os.getuid()}"
     os.makedirs(runtime, mode=0o700, exist_ok=True)
-    return os.path.join(runtime, "alienfx.lock")
+    return runtime
+
+
+def _lock_path():
+    return os.path.join(runtime_dir(), "alienfx.lock")
+
+
+def try_lock(name, retries=0):
+    """Return an open file holding the named lock, or None. A crash releases it."""
+    lock = open(os.path.join(runtime_dir(), name), "w")
+    for attempt in range(retries + 1):
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return lock
+        except OSError:
+            if attempt < retries:
+                time.sleep(.02)
+    lock.close()
+    return None
+
+
+def lock_held(name):
+    """Whether any open file holds the lock. A shared probe cannot block a real holder."""
+    try:
+        lock = open(os.path.join(runtime_dir(), name))   # read-only: raises no change event
+    except FileNotFoundError:
+        return False
+    with lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            return False
+        except OSError:
+            return True
 
 
 def _run(args, stdin=None):
@@ -132,11 +167,11 @@ class LiveWriter:
                 frame, self._pending = self._pending, None
                 self._busy = True
             ok, message = True, None
+            if _stamp() != self._stamp:            # another process wrote the lights
+                self._last = None
             if frame != self._last:
                 start = time.monotonic()
                 try:
-                    if _stamp() != self._stamp:    # another process wrote the lights
-                        self._last = None
                     self._stamp = send(delta(frame, self._last))
                     self._last = frame
                     message = f"{(time.monotonic() - start) * 1000:.0f} ms"

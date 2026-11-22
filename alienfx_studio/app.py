@@ -1,25 +1,30 @@
 """Main window: the Obsidian editor shell and Library navigation."""
 import colorsys
+import os
 import sys
 
-from PyQt6.QtCore import QPointF, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, QPointF, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (QColor, QFontMetrics, QKeySequence, QPainter, QRadialGradient, QShortcut)
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtWidgets import (QApplication, QColorDialog, QHBoxLayout, QInputDialog, QLabel,
                              QMainWindow, QMenu, QMessageBox, QPushButton, QSizePolicy, QSlider,
                              QStackedWidget, QSystemTrayIcon, QVBoxLayout, QWidget)
 
-from . import device, layout, theme
+from . import device, layout, rules, theme
 from .color_dock import ColorDock
+from .file_events import FileEvents
+from .games import GamesPage
+from .inotify import OVERFLOW
 from .keyboard_view import KeyboardView
 from .library import LibraryPage
-from .profiles import Profile, ProfileError, Store, to_hex
+from .profiles import PICKED, Profile, ProfileError, Store, to_hex
 from .tray import Tray, app_icon
 
 SERVER_NAME = "alienfx-studio"
 MAX_UNDO = 100
 MAX_RECENT = 10
 _STATUS_WIDTH = 340
+_STATE_FILES = {"state.json", "alienfx-showing.json", "alienfx-running.json", device.WATCH_LOCK}
 
 
 class Backdrop(QWidget):
@@ -43,8 +48,13 @@ class MainWindow(QMainWindow):
         super().__init__()
         theme.apply(QApplication.instance())
         self.store = Store()
-        self.profile = self.store.load(self.store.active_name())
+        self.store.drop_stale_showing()
+        self.profile = self.store.load(self.store.current_name())
         self.saved = self.profile.to_dict()
+        self.game_session = None        # (profile, game) while a game controls the lights
+        self._pause_lock = None
+        self._restore_pending = False   # a dead watcher left game lighting on the keys
+        self._state_stamp = self.store.state_stamp()
         self.undo_stack, self.redo_stack = [], []
         self.recent = []
         self._syncing = False
@@ -63,6 +73,9 @@ class MainWindow(QMainWindow):
         self._refresh_profiles()
         self._sync_controls()
         self._update_selection_ui()
+        self.file_events = FileEvents(self)
+        self.file_events.changed.connect(self._files_changed)
+        self.file_events.watch([self.store.root, device.runtime_dir()])
 
     # ---- UI construction ----
     def _build_ui(self):
@@ -74,6 +87,8 @@ class MainWindow(QMainWindow):
         self.library = LibraryPage(self)
         self.pages.addWidget(self.library)      # the home screen
         self.pages.addWidget(self.editor_page)
+        self.games = GamesPage(self)
+        self.pages.addWidget(self.games)
         shell.addWidget(self.pages)
         self.setCentralWidget(root)
         self.setMinimumSize(1040, 517)
@@ -180,10 +195,21 @@ class MainWindow(QMainWindow):
     # ---- navigation ----
     def show_editor(self):
         self.pages.setCurrentWidget(self.editor_page)
+        self._update_pause()
 
     def show_library(self):
         self.set_paint_mode(False)
         self.pages.setCurrentWidget(self.library)
+        self._update_pause()
+
+    def show_games(self):
+        self.set_paint_mode(False)
+        self.pages.setCurrentWidget(self.games)
+        self._update_pause()
+
+    def open_games(self):
+        self.show_games()
+        self.present()
 
     def open_editor(self):
         self.show_editor()
@@ -197,7 +223,13 @@ class MainWindow(QMainWindow):
     def _picker_hex(self):
         return to_hex(self.picker.currentColor().getRgb()[:3])
 
+    def _read_game_session(self):
+        showing = self.store.showing()
+        in_game = showing is not None and showing[1] != PICKED
+        self.game_session = (showing[0], self.store.showing_game()) if in_game else None
+
     def _refresh_profiles(self):
+        self._read_game_session()
         self.library.invalidate()
         self._update_title()
         if self.tray:
@@ -212,6 +244,7 @@ class MainWindow(QMainWindow):
         self.picker.set_dirty(dirty)
         self.revert_action.setEnabled(dirty)
         self.library.sync_active()
+        self._update_pause()
 
     def _sync_controls(self):
         self._syncing = True
@@ -444,17 +477,20 @@ class MainWindow(QMainWindow):
             return not self.dirty
         return answer == QMessageBox.StandardButton.Discard
 
-    def _load(self, profile):
+    def _load(self, profile, choose=True):
+        """Show a profile. With choose=False, the watcher already put it on the lights."""
         self.profile = profile
         self.saved = profile.to_dict()
         self.undo_stack.clear()
         self.redo_stack.clear()
         self._end_edit_silently()
-        self.store.set_active(profile.name)
+        if choose:
+            self.store.choose(profile.name)
         self._refresh_profiles()
         self._sync_controls()
         self._selection_changed()
-        self._push_live()
+        if choose:
+            self._push_live()
 
     def switch_profile(self, name):
         if name == self.profile.name or not self._confirm_unsaved():
@@ -476,7 +512,7 @@ class MainWindow(QMainWindow):
     def save(self):
         if self._guard(self.store.save, self.profile):
             self.saved = self.profile.to_dict()
-            self.store.set_active(self.profile.name)
+            self.store.choose(self.profile.name)
             self._refresh_profiles()
 
     def _ask_name(self, title, current):
@@ -497,7 +533,7 @@ class MainWindow(QMainWindow):
         if self._guard(self.store.save, copy):
             self.profile = copy
             self.saved = copy.to_dict()
-            self.store.set_active(name)
+            self.store.choose(name)
             self._refresh_profiles()
 
     def rename(self):
@@ -526,8 +562,7 @@ class MainWindow(QMainWindow):
             return
         try:
             self.store.delete(self.profile.name)
-            remaining = self.store.list()
-            self._load(self.store.load(remaining[0][1]))
+            self._load(self.store.load(self.store.current_name()))
         except (ProfileError, OSError) as e:
             QMessageBox.warning(self, "AlienFX Lighting Studio", str(e))
 
@@ -546,7 +581,86 @@ class MainWindow(QMainWindow):
         self.undo_stack.clear()
         self.redo_stack.clear()
 
+    # ---- game sessions ----
+    def _update_pause(self):
+        """Hold the watcher off while the editor is open or has unsaved edits."""
+        paused = self.dirty or (self.isVisible() and not self.isMinimized()
+                                and self.pages.currentWidget() is self.editor_page)
+        if paused and self._pause_lock is None:
+            self._pause_lock = device.try_lock(device.EDITOR_LOCK)
+        elif not paused and self._pause_lock is not None:
+            self._pause_lock.close()
+            self._pause_lock = None
+            QTimer.singleShot(0, self._poll_game_state)     # catch up on what editing held back
+
+    def _files_changed(self, paths):
+        """React to the watcher, the command line, or a crash. None means anything changed."""
+        names = None if paths is None or OVERFLOW in paths \
+            else {os.path.basename(path) for path in paths}
+        if names is None or names & _STATE_FILES:
+            self._poll_game_state()
+            self.games.update_status()
+        if names is None or "rules.json" in names:
+            self.games.rules_changed()
+
+    def _poll_game_state(self):
+        self._update_pause()
+        self._restore_pending |= self.store.drop_stale_showing()
+        stamp = self.store.state_stamp()
+        if stamp == self._state_stamp and not self._restore_pending:
+            return
+        self._read_game_session()
+        self.library.sync_active()
+        if self._pause_lock is not None:
+            return                      # handled when editing ends, because the stamp stays old
+        self._state_stamp = stamp
+        try:
+            name = self.store.current_name()
+            if name != self.profile.name:
+                self._load(self.store.load(name), choose=False)
+            else:
+                self.library.invalidate()
+        except (ProfileError, OSError) as e:
+            print(f"alienfx-studio: {e}", file=sys.stderr)
+            return
+        if self._restore_pending:
+            self._restore_pending = False
+            self._push_live()
+
+    def set_default_profile(self, name):
+        """Change the default profile. The lights stay as they are."""
+        self._guard(self.store.set_default, name)
+        self._refresh_profiles()
+
+    def auto_switch(self):
+        try:
+            return rules.load(self.store.root).enabled
+        except (ProfileError, OSError):
+            return False
+
+    def set_auto_switch(self, on):
+        try:
+            table = rules.load(self.store.root)
+            table.enabled = bool(on)
+            rules.save(self.store.root, table)
+        except (ProfileError, OSError) as e:
+            QMessageBox.warning(self, "AlienFX Lighting Studio", str(e))
+        self.games.sync_auto_switch()
+
     # ---- window lifecycle ----
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._update_pause()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self._update_pause()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange:
+            self._update_pause()
+
     def present(self):
         self.show()
         self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized)
