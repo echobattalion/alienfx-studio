@@ -2,14 +2,19 @@
 
 Uses a fake CLI and temporary directories, so it never touches real lights.
 """
+import contextlib
+import io
 import json
 import os
 import stat
+import struct
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -25,11 +30,12 @@ with open({str(LOG)!r}, "a") as f:
 """)
 FAKE.chmod(FAKE.stat().st_mode | stat.S_IEXEC)
 os.environ.update(ALIENFX_CLI=str(FAKE), XDG_RUNTIME_DIR=TMP.name, XDG_CONFIG_HOME=TMP.name,
+                  ALIENFX_STEAM_ROOT=str(Path(TMP.name) / "no-steam"),
                   QT_QPA_PLATFORM="offscreen")
 os.environ.pop("ALIENFX_KEYBOARD_DEV", None)
 os.environ.pop("ALIENFX_ELC_DEV", None)
 
-from alienfx_studio import device, kbmap  # noqa: E402
+from alienfx_studio import device, kbmap, rules, steam, watcher  # noqa: E402
 from alienfx_studio.profiles import Profile, ProfileError, Store, default_profile  # noqa: E402
 
 
@@ -428,6 +434,672 @@ class RedesignGuiTests(unittest.TestCase):
                "keyboard": {"default": "#112233", "keys": {"W": "#FF0000", "ZZZ": "#00FF00"}},
                "elc": {"default": "#445566", "zones": {"3": "#0000FF"}}}
         self.assertEqual(Profile.from_dict(old).to_dict(), old)
+
+
+class ShowingTests(unittest.TestCase):
+    """A game's temporary profile must never become the one restored at login."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.store = Store(self.dir.name)
+        game = default_profile()
+        game.name = "Game"
+        self.store.save(game)
+
+    def test_showing_leaves_normal_profile_alone(self):
+        self.store.set_showing("Game", "steam:1677110")
+        self.assertEqual(self.store.showing(), ("Game", "steam:1677110"))
+        self.assertEqual(self.store.current_name(), "Game")
+        self.assertEqual(self.store.active_name(), "Default")
+        self.assertEqual(json.loads(self.store.state.read_text()), {"active": "Default"})
+
+    def test_clearing_returns_to_normal(self):
+        self.store.set_showing("Game", "steam:1")
+        self.store.clear_showing()
+        self.store.clear_showing()      # already gone is fine
+        self.assertIsNone(self.store.showing())
+        self.assertEqual(self.store.current_name(), "Default")
+
+    def test_lost_runtime_file_returns_to_normal(self):
+        self.store.set_showing("Game", "steam:1")
+        self.store.showing_path.unlink()        # what a reboot does
+        self.assertEqual(Store(self.dir.name).current_name(), "Default")
+
+    def test_choosing_a_profile_ends_temporary_one(self):
+        self.store.set_showing("Game", "steam:1")
+        self.store.set_active("Game")
+        self.assertIsNone(self.store.showing())
+        self.assertEqual(self.store.active_name(), "Game")
+
+    def test_rename_follows_temporary_profile(self):
+        self.store.set_showing("Game", "steam:1")
+        self.store.rename("Game", "Renamed")
+        self.assertEqual(self.store.showing(), ("Renamed", "steam:1"))
+        self.assertEqual(self.store.active_name(), "Default")
+
+    def test_renaming_normal_profile_keeps_temporary_one(self):
+        self.store.set_showing("Game", "steam:1")
+        self.store.rename("Default", "Home")
+        self.assertEqual(self.store.active_name(), "Home")
+        self.assertEqual(self.store.showing(), ("Game", "steam:1"))
+
+    def test_deleted_or_corrupt_temporary_profile_is_ignored(self):
+        self.store.set_showing("Game", "steam:1")
+        self.store.delete("Game")
+        self.assertIsNone(self.store.showing())
+        self.assertEqual(self.store.current_name(), "Default")
+        for text in ("not json", "[]", '{"profile": 3, "source": "x"}'):
+            self.store.showing_path.write_text(text)
+            self.assertIsNone(self.store.showing())
+
+    def test_cli_list_and_apply(self):
+        from alienfx_studio import __main__ as cli
+        LOG.unlink(missing_ok=True)
+        env = {"XDG_CONFIG_HOME": self.dir.name, "XDG_RUNTIME_DIR": self.dir.name}
+        store = Store(Path(self.dir.name) / "alienfx")
+        game = default_profile()
+        game.name = "Game"
+        store.save(game)
+
+        def run(*args):
+            out = io.StringIO()
+            with mock.patch.dict(os.environ, env), mock.patch.object(sys, "argv", ["x", *args]), \
+                    contextlib.redirect_stdout(out):
+                self.assertEqual(cli.main(), 0)
+                shown = Store()
+            return out.getvalue().splitlines(), shown
+
+        with mock.patch.dict(os.environ, env):
+            Store().set_showing("Game", "steam:1")
+        self.assertEqual(run("list")[0], ["* Default", "> Game"])
+        _, after = run("apply")                 # what the login service runs
+        self.assertIsNone(after.showing())
+        self.assertEqual(after.active_name(), "Default")
+        self.assertTrue(calls())
+
+
+class RulesTests(unittest.TestCase):
+    def rules(self):
+        return rules.Rules()
+
+    def test_game_link_beats_type(self):
+        table = self.rules()
+        table.type_named("RPG").profile = "Red"
+        table.games["steam:1"] = rules.GameRule(profile="Mine")
+        self.assertEqual(table.profile_for("steam:1", ("RPG",), lambda _: True),
+                         ("Mine", "linked game"))
+        self.assertEqual(table.profile_for("steam:2", ("RPG",), lambda _: True),
+                         ("Red", "RPG type"))
+
+    def test_first_type_in_order_wins_and_override_beats_it(self):
+        table = self.rules()
+        tags = ("FPS", "RPG")
+        self.assertEqual(table.type_of("steam:1", tags).name, "Shooter")
+        table.types.sort(key=lambda t: t.name != "RPG")
+        self.assertEqual(table.type_of("steam:1", tags).name, "RPG")
+        table.games["steam:1"] = rules.GameRule(type="Adventure")
+        self.assertEqual(table.type_of("steam:1", tags).name, "Adventure")
+
+    def test_missing_profile_falls_through(self):
+        table = self.rules()
+        table.type_named("RPG").profile = "Red"
+        table.games["steam:1"] = rules.GameRule(profile="Deleted")
+        self.assertEqual(table.profile_for("steam:1", ("RPG",), lambda n: n == "Red"),
+                         ("Red", "RPG type"))
+        self.assertIsNone(table.profile_for("steam:1", ("RPG",), lambda _: False))
+
+    def test_disabled_matches_nothing(self):
+        table = self.rules()
+        table.enabled = False
+        table.games["steam:1"] = rules.GameRule(profile="Mine")
+        self.assertIsNone(table.profile_for("steam:1", (), lambda _: True))
+
+    def test_round_trip_and_malformed_file(self):
+        with tempfile.TemporaryDirectory() as root:
+            table = self.rules()
+            table.games["steam:1"] = rules.GameRule(profile="Mine", type="RPG")
+            rules.save(root, table)
+            self.assertEqual(rules.load(root).to_dict(), table.to_dict())
+            rules.path(root).write_text("{broken")
+            with self.assertRaises(rules.RulesError):
+                rules.load(root)
+
+    def test_store_rename_updates_links(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = Store(root)
+            table = self.rules()
+            table.type_named("RPG").profile = "Default"
+            table.games["steam:1"] = rules.GameRule(profile="Default")
+            rules.save(root, table)
+            store.rename("Default", "Home")
+            loaded = rules.load(root)
+            self.assertEqual(loaded.type_named("RPG").profile, "Home")
+            self.assertEqual(loaded.games["steam:1"].profile, "Home")
+
+
+def write_appinfo(path, apps):
+    strings = ["appinfo", "common", "type", "store_tags", "0", "1"]
+    key = lambda name: struct.pack("<I", strings.index(name))
+    body = b""
+    for app_id, (kind, tags) in apps.items():
+        vdf = b"\0" + key("appinfo") + b"\0" + key("common")
+        vdf += b"\1" + key("type") + kind.encode() + b"\0"
+        vdf += b"\0" + key("store_tags")
+        for i, tag in enumerate(tags):
+            vdf += b"\2" + key(str(i)) + struct.pack("<i", tag)
+        vdf += b"\x08\x08\x08\x08"
+        body += struct.pack("<II", app_id, 60 + len(vdf)) + bytes(60) + vdf
+    body += struct.pack("<I", 0)
+    table = struct.pack("<I", len(strings)) + b"".join(s.encode() + b"\0" for s in strings)
+    path.write_bytes(struct.pack("<IIq", 0x07564429, 1, 16 + len(body)) + body + table)
+
+
+class SteamTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.root = Path(self.dir.name) / "Steam"
+        extra = Path(self.dir.name) / "Other Drive"
+        (self.root / "steamapps").mkdir(parents=True)
+        (self.root / "appcache").mkdir()
+        (extra / "steamapps").mkdir(parents=True)
+        (self.root / "steamapps" / "libraryfolders.vdf").write_text(
+            f'"libraryfolders"\n{{\n"0"\n{{\n"path" "{extra}"\n}}\n}}\n')
+        self.manifest(self.root, 10, "Beta Game")
+        self.manifest(extra, 20, "Alpha Game")
+        self.manifest(self.root, 30, "Proton Tool")
+        self.info = self.root / "appcache" / "appinfo.vdf"
+        write_appinfo(self.info, {10: ("Game", [1, 2]), 20: ("game", [2, 999]),
+                                  30: ("tool", [1]), 40: ("game", [1])})
+        patcher = mock.patch.object(steam, "tag_names",
+                                    return_value={1: "Automation", 2: "RPG"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def manifest(library, app_id, name):
+        (library / "steamapps" / f"appmanifest_{app_id}.acf").write_text(
+            f'"AppState"\n{{\n"appid" "{app_id}"\n"name" "{name}"\n}}\n')
+
+    def test_reads_games_across_libraries(self):
+        games = steam.Library(self.root).games()
+        self.assertEqual([(g.app_id, g.name, g.tags) for g in games],
+                         [(20, "Alpha Game", ("RPG",)), (10, "Beta Game", ("Automation", "RPG"))])
+
+    def test_bad_appinfo_still_lists_games(self):
+        for content in (b"", b"\0" * 32):
+            self.info.write_bytes(content)
+            with contextlib.redirect_stderr(io.StringIO()):
+                games = steam.Library(self.root).games()
+            self.assertEqual({g.app_id for g in games}, {10, 20, 30})
+            self.assertTrue(all(g.tags == () for g in games))
+
+    def test_unknown_running_game_gets_a_name(self):
+        self.assertEqual(steam.Library(self.root).game(77).name, "Steam app 77")
+
+    def test_bundled_tag_names(self):
+        patcher = mock.patch.stopall
+        patcher()
+        names = steam.tag_names()
+        self.assertIn("Automation", names.values())
+        self.assertIn("Open World Survival Craft", names.values())
+
+
+class FakeLibrary:
+    def __init__(self, tags=None):
+        self.tags = tags or {}
+
+    def game(self, app_id):
+        return steam.Game(app_id, f"Game {app_id}", self.tags.get(app_id, ()))
+
+
+class WatcherTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.store = Store(self.dir.name)
+        for name, color in (("Green", "#00FF00"), ("Red", "#FF0000")):
+            p = default_profile()
+            p.name, p.kb_default = name, color
+            self.store.save(p)
+        table = rules.Rules()
+        table.type_named("Survival").profile = "Green"
+        table.games["steam:2"] = rules.GameRule(profile="Red")
+        rules.save(self.dir.name, table)
+        self.running = set()
+        self.sent = []
+        output = io.StringIO()
+        redirect = contextlib.redirect_stdout(output)
+        redirect.__enter__()
+        self.addCleanup(redirect.__exit__, None, None, None)
+        self.watch = watcher.Watcher(self.store, FakeLibrary({1: ("Survival",)}),
+                                     self.sent.append, lambda: set(self.running))
+
+    def frame(self, name):
+        return device.build_frame(self.store.load(name))
+
+    def test_type_profile_holds_until_exit_then_restores(self):
+        self.running = {1}
+        self.watch.tick(0)
+        self.assertEqual(self.sent, [self.frame("Green")])
+        self.assertEqual(self.store.showing(), ("Green", "steam:1"))
+        self.assertEqual(self.store.active_name(), "Default")
+        self.watch.tick(10)
+        self.assertEqual(len(self.sent), 1)     # staying open never rewrites the lights
+
+        self.running = set()
+        self.watch.tick(20)
+        self.assertEqual(len(self.sent), 1)     # within the grace period
+        self.watch.tick(20 + watcher.EXIT_GRACE)
+        self.assertEqual(self.sent[-1], self.frame("Default"))
+        self.assertIsNone(self.store.showing())
+
+    def test_brief_restart_does_not_flash(self):
+        self.running = {1}
+        self.watch.tick(0)
+        self.running = set()
+        self.watch.tick(1)
+        self.running = {1}
+        self.watch.tick(2)
+        self.running = set()
+        self.watch.tick(3)
+        self.watch.tick(3 + watcher.EXIT_GRACE - 1)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_unlinked_game_changes_nothing(self):
+        self.running = {9}
+        self.watch.tick(0)
+        self.assertEqual(self.sent, [])
+
+    def test_first_game_keeps_lights_then_second_takes_over(self):
+        self.running = {1}
+        self.watch.tick(0)
+        self.running = {1, 2}
+        self.watch.tick(1)
+        self.assertEqual(self.store.showing()[0], "Green")
+        self.running = {2}
+        self.watch.tick(2)
+        self.watch.tick(2 + watcher.EXIT_GRACE)
+        self.assertEqual(self.store.showing(), ("Red", "steam:2"))
+        self.assertEqual(self.sent[-1], self.frame("Red"))
+
+    def test_manual_choice_is_left_alone_until_exit(self):
+        self.running = {1}
+        self.watch.tick(0)
+        self.store.set_active("Red")            # the user picked a profile
+        self.watch.tick(1)
+        self.watch.tick(2)
+        self.assertEqual(len(self.sent), 1)
+        self.assertIsNone(self.store.showing())
+
+        self.running = set()
+        self.watch.tick(3)
+        self.watch.tick(3 + watcher.EXIT_GRACE)
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.store.active_name(), "Red")
+        self.running = {1}
+        self.watch.tick(20)                     # the next launch follows the rules again
+        self.assertEqual(self.store.showing(), ("Green", "steam:1"))
+
+    def test_stale_temporary_profile_is_cleared_on_start(self):
+        self.store.set_showing("Red", "steam:2")
+        self.watch.tick(0)
+        self.assertIsNone(self.store.showing())
+        self.assertEqual(self.sent, [self.frame("Default")])
+
+    def test_rule_changes_apply_during_a_game(self):
+        self.running = {1}
+        self.watch.tick(0)
+        table = rules.load(self.dir.name)
+        table.games["steam:1"] = rules.GameRule(profile="Red")
+        rules.save(self.dir.name, table)
+        os.utime(rules.path(self.dir.name), ns=(1, 1))
+        self.watch.tick(1)
+        self.assertEqual(self.store.showing(), ("Red", "steam:1"))
+
+    def test_broken_rules_keep_last_good_rules(self):
+        self.running = {1}
+        rules.path(self.dir.name).write_text("{broken")
+        self.watch.tick(0)
+        self.assertEqual(self.store.showing(), ("Green", "steam:1"))
+
+    def test_scan_finds_only_steam_reapers(self):
+        with tempfile.TemporaryDirectory() as proc:
+            for pid, comm, args in ((1, "reaper", b"reaper\0SteamLaunch\0AppId=42\0--\0game\0"),
+                                    (2, "oom_reaper", b""),
+                                    (3, "sh", b"sh\0-c\0reaper SteamLaunch AppId=7\0"),
+                                    (4, "reaper", b"reaper\0other\0AppId=8\0"),
+                                    (5, "reaper", b"reaper\0SteamLaunch\0AppId=0\0")):
+                (Path(proc) / str(pid)).mkdir()
+                (Path(proc) / str(pid) / "comm").write_text(comm + "\n")
+                (Path(proc) / str(pid) / "cmdline").write_bytes(args)
+            (Path(proc) / "self").mkdir()
+            self.assertEqual(watcher.running_steam_apps(proc), {42})
+
+
+class ExternalWriteTests(unittest.TestCase):
+    def test_same_frame_is_rewritten_after_another_writer(self):
+        LOG.unlink(missing_ok=True)
+        done = threading.Event()
+        writer = device.LiveWriter(lambda *_: done.set())
+        self.addCleanup(writer.close)
+        frame = device.build_frame(default_profile())
+        writer.submit(frame)
+        self.assertTrue(done.wait(5))
+        done.clear()
+        other = default_profile()
+        other.kb_default = "#010203"
+        time.sleep(.01)
+        device.send(device.build_frame(other))
+        before = len(calls())
+        writer.submit(frame)
+        self.assertTrue(done.wait(5))
+        self.assertGreater(len(calls()), before)
+
+
+class ChooseTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.store = Store(self.dir.name)
+        for name in ("Game", "Pick"):
+            p = default_profile()
+            p.name = name
+            self.store.save(p)
+
+    def hold_watch(self):
+        lock = device.try_lock(device.WATCH_LOCK)
+        self.assertIsNotNone(lock)
+        self.addCleanup(lock.close)
+
+    def test_pick_during_game_is_temporary(self):
+        self.hold_watch()
+        self.store.set_showing("Game", "steam:1", "Some Game")
+        self.store.choose("Pick")
+        self.assertEqual(self.store.showing(), ("Pick", "manual:steam:1"))
+        self.assertEqual(self.store.showing_game(), "Some Game")
+        self.assertEqual(self.store.active_name(), "Default")
+        self.store.choose("Game")
+        self.assertEqual(self.store.showing(), ("Game", "manual:steam:1"))
+
+    def test_saving_the_shown_profile_keeps_the_game_session(self):
+        self.hold_watch()
+        self.store.set_showing("Game", "steam:1")
+        self.store.choose("Game")
+        self.assertEqual(self.store.showing(), ("Game", "steam:1"))
+
+    def test_without_a_watcher_a_pick_is_the_normal_profile(self):
+        self.store.set_showing("Game", "steam:1")
+        self.store.choose("Pick")
+        self.assertIsNone(self.store.showing())
+        self.assertEqual(self.store.active_name(), "Pick")
+
+    def test_stale_temporary_profile_is_dropped_only_without_watcher(self):
+        self.store.set_showing("Game", "steam:1")
+        lock = device.try_lock(device.WATCH_LOCK)
+        self.assertFalse(self.store.drop_stale_showing())
+        lock.close()
+        self.assertTrue(self.store.drop_stale_showing())
+        self.assertIsNone(self.store.showing())
+
+    def test_lock_probe_does_not_block_a_holder(self):
+        self.assertFalse(device.lock_held(device.EDITOR_LOCK))
+        lock = device.try_lock(device.EDITOR_LOCK)
+        self.addCleanup(lock.close)
+        self.assertTrue(device.lock_held(device.EDITOR_LOCK))
+        self.assertIsNone(device.try_lock(device.EDITOR_LOCK))
+
+
+class WatcherCoordinationTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.store = Store(self.dir.name)
+        for name in ("Game", "Pick"):
+            p = default_profile()
+            p.name, p.kb_default = name, "#00FF00" if name == "Game" else "#FF0000"
+            self.store.save(p)
+        table = rules.Rules()
+        table.games["steam:1"] = rules.GameRule(profile="Game")
+        rules.save(self.dir.name, table)
+        self.running, self.sent, self.is_paused = set(), [], False
+        redirect = contextlib.redirect_stdout(io.StringIO())
+        redirect.__enter__()
+        self.addCleanup(redirect.__exit__, None, None, None)
+        self.watch = watcher.Watcher(self.store, FakeLibrary(), self.sent.append,
+                                     lambda: set(self.running), lambda: self.is_paused)
+
+    def test_paused_launch_applies_after_editing(self):
+        self.is_paused, self.running = True, {1}
+        self.watch.tick(0)
+        self.assertEqual(self.sent, [])
+        self.is_paused = False
+        self.watch.tick(1)
+        self.assertEqual(self.store.showing()[0], "Game")
+
+    def test_manual_pick_returns_to_normal_on_exit(self):
+        self.running = {1}
+        self.watch.tick(0)
+        self.store.set_showing("Pick", "manual:steam:1", "Game 1")
+        self.watch.tick(1)
+        self.assertEqual(len(self.sent), 1)
+        self.running = set()
+        self.watch.tick(2)
+        self.watch.tick(2 + watcher.EXIT_GRACE)
+        self.assertIsNone(self.store.showing())
+        self.assertEqual(self.store.active_name(), "Default")
+        self.assertEqual(self.sent[-1], device.build_frame(self.store.load("Default")))
+
+    def test_exit_while_paused_restores_after_editing(self):
+        self.running = {1}
+        self.watch.tick(0)
+        self.is_paused, self.running = True, set()
+        self.watch.tick(1)
+        self.watch.tick(1 + watcher.EXIT_GRACE)
+        self.assertEqual(len(self.sent), 1)
+        self.is_paused = False
+        self.watch.tick(10)
+        self.assertIsNone(self.store.showing())
+        self.assertEqual(self.sent[-1], device.build_frame(self.store.load("Default")))
+
+    def test_stopping_while_paused_does_not_overwrite_editor(self):
+        self.running = {1}
+        self.watch.tick(0)
+        self.is_paused = True
+        self.watch.release()
+        self.assertEqual(len(self.sent), 1)
+        self.assertIsNone(self.store.showing())
+
+
+class GamesGuiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        try:
+            from PyQt6.QtWidgets import QApplication
+        except ImportError:
+            raise unittest.SkipTest("PyQt6 not installed")
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        from alienfx_studio.app import MainWindow
+        self.root = Path(TMP.name) / "alienfx"
+        rules.path(self.root).unlink(missing_ok=True)
+        store = Store()
+        self.original = store.active_name()
+        store.clear_showing()
+        for name in ("Green", "Red"):
+            p = default_profile()
+            p.name = name
+            store.save(p)
+        self.games = [steam.Game(1, "Valheim", ("Survival", "RPG")),
+                      steam.Game(2, "Cyberpunk", ("FPS", "RPG")),
+                      steam.Game(3, "Mystery", ())]
+        patcher = mock.patch("alienfx_studio.games.Library")
+        patcher.start().return_value.games.return_value = self.games
+        self.addCleanup(patcher.stop)
+        scan = mock.patch("alienfx_studio.games.running_steam_apps", return_value={1})
+        scan.start()
+        self.addCleanup(scan.stop)
+        self.win = MainWindow()
+        self.addCleanup(self.cleanup)
+
+    def cleanup(self):
+        self.win._game_timer.stop()
+        self.win.games._status_timer.stop()
+        if self.win._pause_lock:
+            self.win._pause_lock.close()
+            self.win._pause_lock = None
+        self.win.hide()
+        self.win.writer.close()
+        store = Store()
+        store.clear_showing()
+        store.set_active(self.original)
+        for name in ("Green", "Red"):
+            store.delete(name)
+        rules.path(self.root).unlink(missing_ok=True)
+
+    def row(self, name):
+        return next(r for r in self.win.games.game_rows if r.game.name == name)
+
+    def open_games(self):
+        self.win.resize(1440, 900)
+        self.win.show()
+        self.win.show_games()
+        self.app.processEvents()
+        return self.win.games
+
+    def test_library_button_opens_games(self):
+        self.win.show()
+        self.win.library.games_btn.click()
+        self.assertIs(self.win.pages.currentWidget(), self.win.games)
+        self.win.games.back_btn.click()
+        self.assertIs(self.win.pages.currentWidget(), self.win.library)
+
+    def test_rows_show_detected_types_and_running_state(self):
+        self.open_games()
+        self.assertEqual(self.row("Valheim").type.currentText(), "Auto: Survival")
+        self.assertEqual(self.row("Cyberpunk").type.currentText(), "Auto: Shooter")
+        self.assertEqual(self.row("Mystery").type.currentText(), "Auto: none")
+        self.assertFalse(self.row("Valheim").running.isHidden())
+        self.assertTrue(self.row("Mystery").running.isHidden())
+
+    def test_type_profile_flows_to_game_rows_and_disk(self):
+        page = self.open_games()
+        row = next(r for r in page.type_list.rows if r.name == "Survival")
+        row.profile.setCurrentIndex(row.profile.findData("Green"))
+        row.profile.activated.emit(row.profile.currentIndex())
+        self.assertEqual(rules.load(self.root).type_named("Survival").profile, "Green")
+        self.assertEqual(self.row("Valheim").profile.currentText(), "Type: Green")
+
+    def test_game_overrides_save_and_clear(self):
+        self.open_games()
+        row = self.row("Cyberpunk")
+        row.type.setCurrentIndex(row.type.findData("RPG"))
+        row.type.activated.emit(row.type.currentIndex())
+        row = self.row("Cyberpunk")
+        row.profile.setCurrentIndex(row.profile.findData("Red"))
+        row.profile.activated.emit(row.profile.currentIndex())
+        saved = rules.load(self.root).games["steam:2"]
+        self.assertEqual((saved.type, saved.profile), ("RPG", "Red"))
+        row.type.setCurrentIndex(0)
+        row.type.activated.emit(0)
+        row.profile.setCurrentIndex(0)
+        row.profile.activated.emit(0)
+        self.assertNotIn("steam:2", rules.load(self.root).to_dict()["games"])
+
+    def test_keyboard_and_mouse_reorder_types(self):
+        from PyQt6.QtCore import QPoint, Qt
+        from PyQt6.QtTest import QTest
+        page = self.open_games()
+        first = page.type_list.rows[0]
+        QTest.keyClick(first.handle, Qt.Key.Key_Down)
+        self.assertEqual([t.name for t in rules.load(self.root).types][:2],
+                         ["Survival", "Automation"])
+        last = page.type_list.rows[-1]
+        target = page.type_list.rows[0]
+        page.type_list._drag(last, target.mapToGlobal(QPoint(0, 0)).y() - 5)
+        page.type_list._drop()
+        self.assertEqual(rules.load(self.root).types[0].name, "Adventure")
+
+    def test_auto_switch_toggle_and_broken_rules(self):
+        page = self.open_games()
+        page.auto.click()
+        self.assertFalse(rules.load(self.root).enabled)
+        rules.path(self.root).write_text("{broken")
+        page.refresh()
+        self.assertFalse(page.body.isEnabled())
+        self.assertIn("could not be read", page.notice.text())
+        self.assertEqual(rules.path(self.root).read_text(), "{broken")
+
+    def test_editor_and_unsaved_edits_pause_the_watcher(self):
+        self.win.show()
+        self.win.show_library()
+        self.assertFalse(device.lock_held(device.EDITOR_LOCK))
+        self.win.show_editor()
+        self.assertTrue(device.lock_held(device.EDITOR_LOCK))
+        self.win.view.select({"K:W"})
+        self.win.picker.hex.textEdited.emit("#010203")
+        self.win.show_library()
+        self.assertTrue(device.lock_held(device.EDITOR_LOCK), "unsaved edits keep it paused")
+        self.win.undo()
+        self.assertFalse(device.lock_held(device.EDITOR_LOCK))
+
+    def test_gui_follows_watcher_without_writing(self):
+        lock = device.try_lock(device.WATCH_LOCK)
+        self.addCleanup(lock.close)
+        self.win.writer.close()
+        self.win.writer = mock.Mock()
+        self.win.show()
+        self.win.show_library()
+        self.win.store.set_showing("Green", "steam:1", "Valheim")
+        self.win._poll_game_state()
+        self.assertEqual(self.win.profile.name, "Green")
+        self.assertEqual(self.win.game_session, ("Green", "Valheim"))
+        self.assertEqual(self.win.library.cards["Green"].status.text(), "Until Valheim exits")
+        self.win.writer.submit.assert_not_called()
+        self.win.switch_profile("Red")          # a pick during a game
+        self.assertEqual(self.win.store.showing(), ("Red", "manual:steam:1"))
+        self.assertEqual(self.win.store.active_name(), self.original)
+        self.win.store.clear_showing()
+        self.win._poll_game_state()
+        self.assertEqual(self.win.profile.name, self.original)
+
+    def test_crashed_watcher_restores_normal_lighting(self):
+        self.win.store.set_showing("Green", "steam:1", "Valheim")
+        self.win.writer.close()
+        self.win.writer = mock.Mock()
+        self.win._poll_game_state()
+        self.assertIsNone(self.win.store.showing())
+        self.assertEqual(self.win.profile.name, self.original)
+        self.win.writer.submit.assert_called_once()
+
+    def test_crash_during_editing_restores_after_editing(self):
+        self.win.writer.close()
+        self.win.writer = mock.Mock()
+        self.win.show()
+        self.win.show_editor()
+        self.win.store.set_showing("Green", "steam:1", "Valheim")
+        self.win._poll_game_state()
+        self.win.writer.submit.assert_not_called()
+        self.win.show_library()
+        self.win._poll_game_state()
+        self.win.writer.submit.assert_called_once()
+
+    def test_tray_shows_game_and_toggle(self):
+        from alienfx_studio.tray import Tray
+        self.win.store.set_showing("Green", "steam:1", "Valheim")
+        lock = device.try_lock(device.WATCH_LOCK)
+        self.addCleanup(lock.close)
+        self.win._read_game_session()
+        tray = Tray(self.win, lambda: None)
+        self.addCleanup(tray.hide)
+        texts = [a.text() for a in tray.menu.actions()]
+        self.assertIn("Valheim: Green", texts)
+        toggle = next(a for a in tray.menu.actions() if a.text() == "Automatic game switching")
+        self.assertTrue(toggle.isChecked())
+        toggle.trigger()
+        self.assertFalse(rules.load(self.root).enabled)
 
 
 if __name__ == "__main__":

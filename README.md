@@ -55,7 +55,7 @@ The installer:
 2. Downloads a pinned commit of the [alienfx-linux fork](https://github.com/echobattalion/alienfx-linux/tree/alienfx-studio) and builds `alienfx_cli`.
 3. Installs the app to `~/.local/share/alienfx-studio` and the `alienfx-studio` command to `~/.local/bin`.
 4. Installs a udev rule so your user can access the lighting devices. This is the only step that uses `sudo`.
-5. Enables a login service and tray autostart.
+5. Enables a login service, the game watcher, and tray autostart.
 
 Run `./install.sh --help` for options. If the lights do not respond right after installing, log out and back in so the device permissions take effect.
 
@@ -63,9 +63,9 @@ Run `./install.sh --help` for options. If the lights do not respond right after 
 
 ```sh
 alienfx-studio                  # open the editor
-alienfx-studio list             # list profiles (* marks the active one)
+alienfx-studio list             # list profiles (* active, > showing temporarily)
 alienfx-studio apply            # apply the active profile
-alienfx-studio apply "Gaming"   # apply a profile and make it active
+alienfx-studio apply "Gaming"   # apply a profile and make it active (temporary during a game)
 ```
 
 The app opens on the **Library**, which shows every profile as a card. Click a card to apply that profile. **Edit** or a double-click applies it and opens the Editor. Create a profile with the **New profile** card. Previews never change the lights until you choose one of those actions.
@@ -75,6 +75,24 @@ In the Editor, click a key to select it, Ctrl-click to add or remove keys, drag 
 The active profile is the one restored at login. It changes whenever you save or switch profiles.
 
 Profiles are JSON files in `~/.config/alienfx/profiles/`.
+
+### Game profiles
+
+A background watcher can show a profile while a Steam game runs. The profile applies at launch, stays through alt-tabbing, and returns to your normal profile after the game exits. A game's own link wins, then its game type.
+
+Open **Games** from the Library or tray to assign profiles to game types and individual games, override a detected type, drag types into priority order, or turn automatic switching off. Switching waits while the Editor is open or a profile has unsaved changes. The same controls are available from the command line:
+
+```sh
+alienfx-studio games                         # installed games, types, and profiles
+alienfx-studio types                         # game types in match order
+alienfx-studio type-profile Survival "Green" # use a profile for a type (or: none)
+alienfx-studio link "Factorio" "Amber"       # give one game its own profile
+alienfx-studio unlink "Factorio"             # remove that link
+alienfx-studio set-type "Cyberpunk" RPG      # override a game's type (or: auto)
+alienfx-studio type-order RPG Shooter Automation Survival Roguelike Adventure
+```
+
+Types come from each game's Steam store tags. When a game fits several, the first type in the list wins. Rules are stored in `~/.config/alienfx/rules.json`. A profile you choose during a game lasts until that game exits, then your normal profile returns.
 
 ### Update speed
 
@@ -96,6 +114,7 @@ If your devices enumerate in a different order, set `ALIENFX_KEYBOARD_DEV` and `
 - **Wrong lights change:** Your device order or key map differs. See [Other models](#other-models).
 - **No tray icon:** Your desktop may not support system tray icons. The editor still works as a normal window.
 - **Login service:** Inspect it with `journalctl --user -u alienfx-studio.service`.
+- **Game profiles do not switch:** Inspect the watcher with `journalctl --user -u alienfx-studio-watch.service`.
 
 ## Development
 

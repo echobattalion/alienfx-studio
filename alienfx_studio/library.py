@@ -109,6 +109,8 @@ class ProfileCard(QFrame):
         self.name_label.setToolTip(self.name)
         self.name_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.status = QLabel(objectName="muted")
+        self.status.setTextFormat(Qt.TextFormat.PlainText)
+        self.status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         text.addWidget(self.name_label)
         text.addWidget(self.status)
         footer.addLayout(text, 1)
@@ -135,7 +137,15 @@ class ProfileCard(QFrame):
         self.profile = profile
         self.preview.set_profile(profile)
         if self.active:
-            self.status.setText("Unsaved changes" if dirty else "Restored at login")
+            session = self.window_.game_session
+            if dirty:
+                text = "Unsaved changes"
+            elif session and session[0] == self.name:
+                text = f"Until {session[1] or 'the game'} exits"
+            else:
+                text = "Restored at login"
+            self.status.setText(text)
+            self.status.setToolTip(text)
             self.status.setObjectName("unsaved" if dirty else "muted")
             self.status.style().unpolish(self.status)
             self.status.style().polish(self.status)
@@ -224,6 +234,11 @@ class LibraryPage(QWidget):
         titles.addWidget(subtitle)
         head.addLayout(titles)
         head.addStretch()
+        self.games_btn = QPushButton(theme.icon("game", theme.TEXT, 18), "Games")
+        self.games_btn.setToolTip("Choose profiles for games and game types")
+        self.games_btn.clicked.connect(lambda: self.window_.show_games())
+        head.addWidget(self.games_btn)
+        head.addSpacing(10)
         self.search = QLineEdit(objectName="search", placeholderText="Search profiles")
         self.search.setClearButtonEnabled(True)
         self.search.setFocusPolicy(Qt.FocusPolicy.ClickFocus)   # no caret on opening
