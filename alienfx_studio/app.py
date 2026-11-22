@@ -1,129 +1,39 @@
-"""Main editor window."""
+"""Main window: the Obsidian editor shell and Library navigation."""
 import colorsys
 import sys
 
-from PyQt6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QKeySequence, QPainter, QPen, QShortcut
+from PyQt6.QtCore import QPointF, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import (QColor, QFontMetrics, QKeySequence, QPainter, QRadialGradient, QShortcut)
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
-from PyQt6.QtWidgets import (QApplication, QColorDialog, QComboBox, QHBoxLayout,
-                             QInputDialog, QLabel, QMainWindow, QMenu, QMessageBox,
-                             QPushButton, QSizePolicy, QSlider, QSystemTrayIcon,
-                             QToolButton, QVBoxLayout, QWidget)
+from PyQt6.QtWidgets import (QApplication, QColorDialog, QHBoxLayout, QInputDialog, QLabel,
+                             QMainWindow, QMenu, QMessageBox, QPushButton, QSizePolicy, QSlider,
+                             QStackedWidget, QSystemTrayIcon, QVBoxLayout, QWidget)
 
-from . import device, layout
+from . import device, layout, theme
+from .color_dock import ColorDock
+from .keyboard_view import KeyboardView
+from .library import LibraryPage
 from .profiles import Profile, ProfileError, Store, to_hex
 from .tray import Tray, app_icon
 
 SERVER_NAME = "alienfx-studio"
 MAX_UNDO = 100
 MAX_RECENT = 10
+_STATUS_WIDTH = 340
 
 
-class LightView(QWidget):
-    """Draws keys and ELC zones; handles click, Ctrl-click and rubber-band select."""
-    selectionChanged = pyqtSignal()
-
-    def __init__(self, color_of):
-        super().__init__()
-        self.items = layout.build_items()
-        self.color_of = color_of
-        self.selected = set()
-        self._origin = None
-        self._band = None
-        self._base = set()
-        self.setMinimumSize(760, 370)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-
-    def _unit(self):
-        return min((self.width() - 16) / layout.WIDTH, (self.height() - 16) / layout.HEIGHT)
-
-    def _rect(self, item):
-        u = self._unit()
-        return QRectF(8 + item.x * u + 1.5, 8 + item.y * u + 1.5,
-                      item.w * u - 3, item.h * u - 3)
-
-    def _at(self, pos):
-        return next((i for i in self.items if i.enabled and self._rect(i).contains(pos)), None)
+class Backdrop(QWidget):
+    """The window background, with a soft radial glow behind the keyboard."""
 
     def paintEvent(self, _):
         p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        pal = self.palette()
-        u = self._unit()
-        font = QFont(self.font())
-        font.setPixelSize(max(9, int(u * .24)))
-        p.setFont(font)
-        p.setPen(pal.placeholderText().color())
-        for title, x in layout.SECTIONS:
-            p.drawText(QPointF(8 + x * u + 2, 8 + layout.SECTION_Y * u + u * .25), title)
-        for item in self.items:
-            r = self._rect(item)
-            if not item.enabled:
-                p.setPen(QPen(pal.mid().color(), 1, Qt.PenStyle.DashLine))
-                p.setBrush(Qt.BrushStyle.NoBrush)
-                p.drawRoundedRect(r, 4, 4)
-                continue
-            color = QColor(self.color_of(item.id))
-            p.setBrush(color)
-            if item.id in self.selected:
-                p.setPen(QPen(pal.highlightedText().color(), 1))
-                p.drawRoundedRect(r, 4, 4)
-                p.setBrush(Qt.BrushStyle.NoBrush)
-                p.setPen(QPen(pal.highlight().color(), 3))
-                p.drawRoundedRect(r.adjusted(-1, -1, 1, 1), 5, 5)
-            else:
-                p.setPen(QPen(color.darker(160), 1))
-                p.drawRoundedRect(r, 4, 4)
-            luma = .299 * color.red() + .587 * color.green() + .114 * color.blue()
-            p.setPen(QColor("#000000" if luma > 128 else "#FFFFFF"))
-            p.drawText(r, Qt.AlignmentFlag.AlignCenter, item.label)
-        if self._band:
-            p.setPen(QPen(pal.highlight().color(), 1, Qt.PenStyle.DashLine))
-            band = QColor(pal.highlight().color())
-            band.setAlpha(50)
-            p.setBrush(band)
-            p.drawRect(self._band)
-
-    def mousePressEvent(self, e):
-        if e.button() != Qt.MouseButton.LeftButton:
-            return
-        ctrl = bool(e.modifiers() & Qt.KeyboardModifier.ControlModifier)
-        self._origin = e.position()
-        self._base = set(self.selected) if ctrl else set()
-        hit = self._at(e.position())
-        if hit:
-            self.selected = self._base ^ {hit.id}
-        else:
-            self.selected = set(self._base)
-        self.selectionChanged.emit()
-        self.update()
-
-    def mouseMoveEvent(self, e):
-        if self._origin is None:
-            return
-        if (e.position() - self._origin).manhattanLength() < 5:
-            return
-        self._band = QRectF(self._origin, e.position()).normalized()
-        self.selected = self._base | {i.id for i in self.items
-                                      if i.enabled and self._band.intersects(self._rect(i))}
-        self.selectionChanged.emit()
-        self.update()
-
-    def mouseReleaseEvent(self, _):
-        self._origin = None
-        self._band = None
-        self.update()
-
-    def select(self, ids):
-        self.selected = set(ids)
-        self.selectionChanged.emit()
-        self.update()
-
-    def all_ids(self):
-        return {i.id for i in self.items if i.enabled}
-
-    def sizeHint(self):
-        return QSize(900, 430)
+        p.fillRect(self.rect(), QColor(theme.WINDOW))
+        center = QPointF(self.width() / 2, self.height() * .42)
+        gradient = QRadialGradient(center, max(self.width() * .56, 320))
+        gradient.setColorAt(0, QColor(theme.GLOW))
+        gradient.setColorAt(.62, QColor(theme.WINDOW_MID))
+        gradient.setColorAt(1, QColor(theme.WINDOW))
+        p.fillRect(self.rect(), gradient)
 
 
 class MainWindow(QMainWindow):
@@ -131,6 +41,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
+        theme.apply(QApplication.instance())
         self.store = Store()
         self.profile = self.store.load(self.store.active_name())
         self.saved = self.profile.to_dict()
@@ -138,6 +49,8 @@ class MainWindow(QMainWindow):
         self.recent = []
         self._syncing = False
         self._editing = False
+        self._holding = False
+        self._color_edited = False
         self.tray = None
         self._deviceResult.connect(self._show_result)
         self.writer = device.LiveWriter(lambda ok, msg: self._deviceResult.emit(ok, msg or ""))
@@ -149,91 +62,132 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._refresh_profiles()
         self._sync_controls()
+        self._update_selection_ui()
 
     # ---- UI construction ----
     def _build_ui(self):
-        root = QWidget()
-        outer = QVBoxLayout(root)
-
-        top = QHBoxLayout()
-        top.addWidget(QLabel("Profile:"))
-        self.combo = QComboBox(minimumWidth=180)
-        self.combo.activated.connect(self._combo_activated)
-        top.addWidget(self.combo)
-        for text, fn in (("Save", self.save), ("Save as…", self.save_as), ("Revert", self.revert)):
-            button = QPushButton(text)
-            button.clicked.connect(lambda _=False, f=fn: f())
-            top.addWidget(button)
-            if text == "Save":
-                self.save_btn = button
-            elif text == "Revert":
-                self.revert_btn = button
-        more = QToolButton(text="More", popupMode=QToolButton.ToolButtonPopupMode.InstantPopup)
-        menu = QMenu(more)
-        menu.addAction("Rename…", self.rename)
-        menu.addAction("Delete…", self.delete)
-        more.setMenu(menu)
-        top.addWidget(more)
-        top.addStretch()
-        top.addWidget(QLabel("Brightness"))
-        self.bright = QSlider(Qt.Orientation.Horizontal, minimum=0, maximum=100)
-        self.bright.setFixedWidth(160)
-        self.bright.valueChanged.connect(self._brightness_changed)
-        top.addWidget(self.bright)
-        self.bright_label = QLabel(minimumWidth=40)
-        top.addWidget(self.bright_label)
-        outer.addLayout(top)
-
-        mid = QHBoxLayout()
-        self.view = LightView(lambda item: self.profile.color_of(item))
-        self.view.selectionChanged.connect(self._selection_changed)
-        mid.addWidget(self.view, 1)
-
-        side = QVBoxLayout()
-        self.picker = QColorDialog(self)
-        self.picker.setOptions(QColorDialog.ColorDialogOption.NoButtons
-                               | QColorDialog.ColorDialogOption.DontUseNativeDialog)
-        self.picker.setWindowFlags(Qt.WindowType.Widget)
-        self.picker.currentColorChanged.connect(self._picker_changed)
-        side.addWidget(self.picker)
-        side.addWidget(QLabel("Recent colors"))
-        self.recent_row = QHBoxLayout()
-        self.recent_row.setSpacing(3)
-        self.recent_row.addStretch()
-        side.addLayout(self.recent_row)
-        tools = QHBoxLayout()
-        fill = QPushButton("Fill selection")
-        fill.clicked.connect(lambda: self._paint(self._picker_hex()))
-        tools.addWidget(fill)
-        grad = QToolButton(text="Touchpad gradient",
-                           popupMode=QToolButton.ToolButtonPopupMode.InstantPopup)
-        grad_menu = QMenu(grad)
-        grad_menu.addAction("Rainbow", self._rainbow)
-        grad_menu.addAction("Two colors…", self._two_color)
-        grad.setMenu(grad_menu)
-        tools.addWidget(grad)
-        side.addLayout(tools)
-        side.addStretch()
-        mid.addLayout(side)
-        outer.addLayout(mid, 1)
-
-        bottom = QHBoxLayout()
-        bottom.addWidget(QLabel("Select:"))
-        for text, ids in [("All", None), ("None", set())] + list(layout.GROUPS.items()):
-            button = QPushButton(text)
-            button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
-            button.clicked.connect(lambda _=False, s=ids: self.view.select(
-                self.view.all_ids() if s is None else s))
-            bottom.addWidget(button)
-        bottom.addStretch()
-        self.status = QLabel("Live: ready")
-        bottom.addWidget(self.status)
-        outer.addLayout(bottom)
+        root = Backdrop()
+        shell = QVBoxLayout(root)
+        shell.setContentsMargins(0, 0, 0, 0)
+        self.pages = QStackedWidget()
+        self.editor_page = self._build_editor()
+        self.library = LibraryPage(self)
+        self.pages.addWidget(self.library)      # the home screen
+        self.pages.addWidget(self.editor_page)
+        shell.addWidget(self.pages)
         self.setCentralWidget(root)
+        self.setMinimumSize(1040, 517)
+        self.resize(1440, 900)
 
         QShortcut(QKeySequence.StandardKey.Undo, self, self.undo)
         QShortcut(QKeySequence("Ctrl+Shift+Z"), self, self.redo)
         QShortcut(QKeySequence.StandardKey.Save, self, self.save)
+        QShortcut(QKeySequence("B"), self, self._toggle_paint_mode)
+        self._paint_exit = QShortcut(QKeySequence("Esc"), self,
+                                     lambda: self.set_paint_mode(False))
+        self._paint_exit.setEnabled(False)
+
+    def _build_editor(self):
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(20, 10, 20, 12)
+        outer.setSpacing(6)
+
+        header = QHBoxLayout()
+        header.setSpacing(14)
+        self.back_btn = QPushButton(theme.icon("back", theme.TEXT, 16), "Library")
+        self.back_btn.setToolTip("Back to Library")
+        self.back_btn.clicked.connect(lambda: self.show_library())
+        header.addWidget(self.back_btn)
+        self.profile_label = QLabel(objectName="appName")
+        self.profile_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.profile_label.setSizePolicy(QSizePolicy.Policy.Ignored,
+                                         QSizePolicy.Policy.Preferred)
+        header.addWidget(self.profile_label, 1)
+        right = QWidget()
+        right.setFixedWidth(230)
+        bright = QHBoxLayout(right)
+        bright.setContentsMargins(0, 0, 0, 0)
+        bright.setSpacing(9)
+        sun = QLabel(toolTip="Brightness")
+        sun.setPixmap(theme.icon("sun", theme.TEXT, 18).pixmap(18, 18))
+        bright.addWidget(sun)
+        self.bright = QSlider(Qt.Orientation.Horizontal, minimum=0, maximum=100)
+        self.bright.setAccessibleName("Brightness")
+        self.bright.valueChanged.connect(self._brightness_changed)
+        self.bright.sliderPressed.connect(self._hold_edit)
+        self.bright.sliderReleased.connect(self._release_edit)
+        bright.addWidget(self.bright, 1)
+        self.bright_label = QLabel(minimumWidth=38,
+                                   alignment=Qt.AlignmentFlag.AlignRight
+                                   | Qt.AlignmentFlag.AlignVCenter)
+        bright.addWidget(self.bright_label)
+        header.addWidget(right)
+        outer.addLayout(header)
+
+        self.view = KeyboardView(lambda item: self.profile.color_of(item),
+                                 lambda: self.profile.brightness)
+        self.view.selectionChanged.connect(self._selection_changed)
+        self.view.paintStarted.connect(self._hold_edit)
+        self.view.paintItem.connect(self._paint_item)
+        self.view.paintFinished.connect(self._release_edit)
+        outer.addWidget(self.view, 1)
+
+        chips = QHBoxLayout()
+        chips.setSpacing(6)
+        self.chips = {}
+        for text, ids in [("All", None), ("None", set())] + list(layout.GROUPS.items()):
+            chip = QPushButton(text, objectName="chip", checkable=True)
+            chip.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+            chip.clicked.connect(lambda _=False, s=ids: self._chip_clicked(s))
+            chips.addWidget(chip)
+            self.chips[text] = chip
+        chips.addStretch()
+        self.status = QLabel("Live: ready", objectName="muted")
+        self.status.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.status.setMaximumWidth(_STATUS_WIDTH)
+        chips.addWidget(self.status)
+        outer.addLayout(chips)
+
+        self.picker = ColorDock()
+        self.picker.currentColorChanged.connect(self._picker_changed)
+        self.picker.interactionStarted.connect(self._hold_edit)
+        self.picker.interactionFinished.connect(self._release_edit)
+        self.picker.paint_btn.toggled.connect(self.set_paint_mode)
+        self.picker.fill_btn.clicked.connect(lambda: self._paint(self._picker_hex()))
+        self.picker.undo_btn.clicked.connect(lambda: self.undo())
+        self.picker.save_btn.clicked.connect(lambda: self.save())
+        self.save_btn = self.picker.save_btn
+
+        menu = QMenu(self.picker.more_btn)
+        menu.addAction("Save as…", self.save_as)
+        self.revert_action = menu.addAction("Revert", self.revert)
+        menu.addAction("Rename…", self.rename)
+        menu.addAction("Delete…", self.delete)
+        menu.addSeparator()
+        gradient = menu.addMenu("Touchpad gradient")
+        gradient.addAction("Rainbow", self._rainbow)
+        gradient.addAction("Two colors…", self._two_color)
+        self.picker.more_btn.setMenu(menu)
+
+        dock_row = QHBoxLayout()
+        dock_row.addStretch()
+        dock_row.addWidget(self.picker, 100)
+        dock_row.addStretch()
+        outer.addLayout(dock_row)
+        return page
+
+    # ---- navigation ----
+    def show_editor(self):
+        self.pages.setCurrentWidget(self.editor_page)
+
+    def show_library(self):
+        self.set_paint_mode(False)
+        self.pages.setCurrentWidget(self.library)
+
+    def open_editor(self):
+        self.show_editor()
+        self.present()
 
     # ---- state helpers ----
     @property
@@ -244,22 +198,20 @@ class MainWindow(QMainWindow):
         return to_hex(self.picker.currentColor().getRgb()[:3])
 
     def _refresh_profiles(self):
-        self.combo.clear()
-        for _, name in self.store.list():
-            self.combo.addItem(name)
-        self.combo.setCurrentText(self.profile.name)
+        self.library.invalidate()
         self._update_title()
         if self.tray:
             self.tray.rebuild()
 
     def _update_title(self):
-        mark = "*" if self.dirty else ""
+        dirty = self.dirty
+        mark = "*" if dirty else ""
         self.setWindowTitle(f"{self.profile.name}{mark} - AlienFX Lighting Studio")
-        i = self.combo.findText(self.profile.name)
-        if i >= 0:
-            self.combo.setItemText(i, self.profile.name)
-        self.save_btn.setText("Save*" if self.dirty else "Save")
-        self.revert_btn.setEnabled(self.dirty)
+        self.profile_label.setText(self.profile.name)
+        self.profile_label.setToolTip(self.profile.name)
+        self.picker.set_dirty(dirty)
+        self.revert_action.setEnabled(dirty)
+        self.library.sync_active()
 
     def _sync_controls(self):
         self._syncing = True
@@ -273,8 +225,11 @@ class MainWindow(QMainWindow):
         self.writer.submit(device.build_frame(self.profile))
 
     def _show_result(self, ok, message):
-        self.status.setText(f"Live: OK ({message})" if ok else f"Live: failed: {message}")
-        self.status.setStyleSheet("" if ok else "color: #d33;")
+        text = f"Live: OK ({message})" if ok else f"Live: failed: {message}"
+        metrics = QFontMetrics(self.status.font())
+        self.status.setText(metrics.elidedText(text, Qt.TextElideMode.ElideRight, _STATUS_WIDTH))
+        self.status.setToolTip(text)
+        self.status.setStyleSheet("" if ok else f"color: {theme.DANGER};")
 
     def _begin_edit(self):
         if not self._editing:
@@ -282,12 +237,26 @@ class MainWindow(QMainWindow):
             del self.undo_stack[:-MAX_UNDO]
             self.redo_stack.clear()
             self._editing = True
-        self._edit_timer.start()
+        if self._holding:
+            self._edit_timer.stop()
+        else:
+            self._edit_timer.start()
 
     def _end_edit(self):
         self._editing = False
-        if self.view.selected:
+        if self._color_edited and (self.view.selected or self.view.paint_mode):
             self._remember(self._picker_hex())
+        self._color_edited = False
+
+    def _hold_edit(self):
+        """A drag started: keep it as one undo step, however long it pauses."""
+        self._holding = True
+        self._edit_timer.stop()
+
+    def _release_edit(self):
+        self._holding = False
+        if self._editing:
+            self._end_edit()
 
     def _changed(self):
         self.view.update()
@@ -297,6 +266,7 @@ class MainWindow(QMainWindow):
     # ---- editing ----
     def _selection_changed(self):
         self._end_edit_silently()
+        self._update_selection_ui()
         if not self.view.selected:
             return
         first = next(i.id for i in self.view.items if i.id in self.view.selected)
@@ -304,9 +274,37 @@ class MainWindow(QMainWindow):
         self.picker.setCurrentColor(QColor(self.profile.color_of(first)))
         self._syncing = False
 
+    def _update_selection_ui(self):
+        if self.view.paint_mode:
+            for chip in self.chips.values():
+                chip.setChecked(False)
+            self.picker.set_selection_label("Painting · click keys")
+            return
+        selected = self.view.selected
+        everything = self.view.all_ids()
+        matched = None
+        for text, chip in self.chips.items():
+            ids = everything if text == "All" else set() if text == "None" \
+                else layout.GROUPS[text]
+            same = selected == ids
+            chip.setChecked(same)
+            if same and selected and matched is None:
+                matched = text
+        count = len(selected)
+        if not count:
+            label = "Select keys to color"
+        elif matched:
+            label = f"{matched} · {count} lights"
+        elif count == 1:
+            label = next(i.label for i in self.view.items if i.id in selected)
+        else:
+            label = f"{count} lights"
+        self.picker.set_selection_label(label)
+
     def _end_edit_silently(self):
         self._edit_timer.stop()
         self._editing = False
+        self._color_edited = False
 
     def _picker_changed(self, _):
         if not self._syncing:
@@ -318,9 +316,53 @@ class MainWindow(QMainWindow):
         if all(self.profile.color_of(i) == value for i in self.view.selected):
             return
         self._begin_edit()
+        self._color_edited = True
         for item in self.view.selected:
             self.profile.set_color(item, value)
         self._changed()
+
+    # ---- paint mode ----
+    def set_paint_mode(self, on):
+        if on == self.view.paint_mode:
+            return
+        if self._editing and not self._holding:
+            self._end_edit()
+        self.view.set_paint_mode(on)
+        self.picker.paint_btn.setChecked(on)
+        self.picker.fill_btn.setEnabled(not on)
+        self.chips["None"].setEnabled(not on)
+        self._paint_exit.setEnabled(on)
+        self._update_selection_ui()
+
+    def _toggle_paint_mode(self):
+        if self.pages.currentWidget() is self.editor_page:
+            self.set_paint_mode(not self.view.paint_mode)
+
+    def _paint_item(self, item):
+        value = self._picker_hex()
+        if self.profile.color_of(item) == value:
+            return
+        self._begin_edit()
+        self._color_edited = True
+        self.profile.set_color(item, value)
+        self._changed()
+
+    def _chip_clicked(self, ids):
+        targets = self.view.all_ids() if ids is None else ids
+        if not self.view.paint_mode:
+            self.view.select(targets)
+            return
+        value = self._picker_hex()               # in paint mode a chip fills its group
+        changed = [i for i in targets if self.profile.color_of(i) != value]
+        if changed:
+            self._end_edit_silently()
+            self._begin_edit()
+            for item in changed:
+                self.profile.set_color(item, value)
+            self._changed()
+            self._remember(value)
+            self._end_edit_silently()
+        self._update_selection_ui()
 
     def _brightness_changed(self, value):
         self.bright_label.setText(f"{value}%")
@@ -335,16 +377,7 @@ class MainWindow(QMainWindow):
             self.recent.remove(value)
         self.recent.insert(0, value)
         del self.recent[MAX_RECENT:]
-        while self.recent_row.count() > 1:
-            widget = self.recent_row.takeAt(0).widget()
-            if widget:
-                widget.deleteLater()
-        for i, color in enumerate(self.recent):
-            swatch = QPushButton(toolTip=color)
-            swatch.setFixedSize(24, 24)
-            swatch.setStyleSheet(f"background: {color}; border: 1px solid #555; border-radius: 3px;")
-            swatch.clicked.connect(lambda _=False, c=color: self.picker.setCurrentColor(QColor(c)))
-            self.recent_row.insertWidget(i, swatch)
+        self.picker.set_recent(self.recent)
 
     def _set_touchpad(self, colors):
         self._end_edit_silently()
@@ -433,8 +466,12 @@ class MainWindow(QMainWindow):
         else:
             self._refresh_profiles()
 
-    def _combo_activated(self, _):
-        self.switch_profile(self.combo.currentText())
+    def edit_profile(self, name):
+        """Apply a profile if needed, then open it in the editor."""
+        if name != self.profile.name:
+            self.switch_profile(name)
+        if name == self.profile.name:
+            self.show_editor()
 
     def save(self):
         if self._guard(self.store.save, self.profile):
@@ -473,6 +510,15 @@ class MainWindow(QMainWindow):
         if renamed:
             self._load(renamed)
 
+    def rename_profile(self, name):
+        """Rename any profile. A non-active one leaves the current edits alone."""
+        if name == self.profile.name:
+            self.rename()
+            return
+        new = self._ask_name("Rename profile", name)
+        if new and new != name and self._guard(self.store.rename, name, new):
+            self._refresh_profiles()
+
     def delete(self):
         answer = QMessageBox.question(self, "Delete profile",
                                       f"Delete {self.profile.name}? This cannot be undone.")
@@ -484,6 +530,16 @@ class MainWindow(QMainWindow):
             self._load(self.store.load(remaining[0][1]))
         except (ProfileError, OSError) as e:
             QMessageBox.warning(self, "AlienFX Lighting Studio", str(e))
+
+    def delete_profile(self, name):
+        """Delete any profile. A non-active one leaves the current edits alone."""
+        if name == self.profile.name:
+            self.delete()
+            return
+        answer = QMessageBox.question(self, "Delete profile",
+                                      f"Delete {name}? This cannot be undone.")
+        if answer == QMessageBox.StandardButton.Yes and self._guard(self.store.delete, name):
+            self._refresh_profiles()
 
     def revert(self):
         self._restore(self.saved)

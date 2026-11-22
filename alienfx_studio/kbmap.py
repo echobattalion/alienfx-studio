@@ -3,7 +3,7 @@
 
 Derived empirically from mod-7 barcode photos. Rows sit on a stride of 20,
 but wide keys consume extra indices, so payload keys drift within each row.
-Spaces/RWin have no LEDs. Dead indices are simply absent from KEYS.
+Space has no LED and the mic-mute light is fixed. Dead indices are simply absent from KEYS.
 """
 N = 136
 
@@ -53,6 +53,13 @@ KEYS["UP"]   = [114]
 KEYS["LEFT"]  = [119, 126, 133]
 KEYS["DOWN"]  = [120, 127, 134]
 KEYS["RIGHT"] = [121, 128, 135]
+
+# --- media column and right Windows-lock key, verified by a per-LED hardware probe ---
+# The mic-mute key is absent on purpose: its light is fixed white and takes no color.
+KEYS["MEDIA2"] = [18]                  # volume up
+KEYS["MEDIA3"] = [17]                  # volume down
+KEYS["MEDIA4"] = [16, 113, 115]        # audio mute: each index alone lights this key
+KEYS["RWIN"] = [109]
 
 # --- semantic groups for the scheme ---
 WASD  = ["W", "A", "S", "D"]
