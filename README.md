@@ -68,7 +68,9 @@ alienfx-studio apply            # apply the active profile
 alienfx-studio apply "Gaming"   # apply a profile and make it active
 ```
 
-In the editor, click a key to select it, Ctrl-click to add or remove keys, or drag across a group. Picking a color updates the laptop immediately. Press **Save** to keep the change.
+The app opens on the **Library**, which shows every profile as a card. Click a card to apply that profile. **Edit** or a double-click applies it and opens the Editor. Create a profile with the **New profile** card. Previews never change the lights until you choose one of those actions.
+
+In the Editor, click a key to select it, Ctrl-click to add or remove keys, drag across a group, or use the group chips under the keyboard. Set a color with the hue and saturation sliders, the hex field, or a recent color. Click the large swatch for darker shades. To apply one color to many keys, turn on **Paint mode** with the brush button or `B`, then click or drag across keys. A group chip fills that group, and `Esc` exits. Changes reach the laptop immediately. Press **Save** to keep them. The `⋯` menu holds Save as, Revert, Rename, Delete, and the touchpad gradient. Use the **Library** button to go back. Unsaved edits are kept and marked on the profile's card.
 
 The active profile is the one restored at login. It changes whenever you save or switch profiles.
 
@@ -90,7 +92,7 @@ If your devices enumerate in a different order, set `ALIENFX_KEYBOARD_DEV` and `
 
 ## Troubleshooting
 
-- **`Live: failed` in the status bar:** Check that the udev rule is installed, then log out and back in.
+- **`Live: failed` beside the group chips:** Check that the udev rule is installed, then log out and back in.
 - **Wrong lights change:** Your device order or key map differs. See [Other models](#other-models).
 - **No tray icon:** Your desktop may not support system tray icons. The editor still works as a normal window.
 - **Login service:** Inspect it with `journalctl --user -u alienfx-studio.service`.
@@ -115,5 +117,7 @@ Tests use a fake CLI and never touch real lights.
 ## Credits and license
 
 Hardware access is provided by [alienfx-linux](https://github.com/tr1xem/alienfx-linux) by tr1xem, through [a GPL-3.0 fork](https://github.com/echobattalion/alienfx-linux/tree/alienfx-studio) that adds batch updates and pins its dependencies. This project is licensed under GPL-3.0. See [LICENSE](LICENSE).
+
+The interface bundles the [Geist and Geist Mono](https://github.com/vercel/geist-font) and [Michroma](https://github.com/googlefonts/Michroma-font) fonts under the SIL Open Font License 1.1. Their licenses are in `alienfx_studio/assets/fonts/`.
 
 This is an unofficial community project and is not affiliated with or endorsed by Dell or Alienware.

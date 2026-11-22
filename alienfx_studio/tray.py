@@ -40,7 +40,7 @@ class Tray(QSystemTrayIcon):
             group.addAction(action)
             self.menu.addAction(action)
         self.menu.addSeparator()
-        self.menu.addAction("Open Editor", self.window.present)
+        self.menu.addAction("Open Editor", self.window.open_editor)
         self.menu.addAction("Quit", self.quit_fn)
 
     def _activated(self, reason):
